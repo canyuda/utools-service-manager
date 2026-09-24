@@ -1,0 +1,11 @@
+# 依赖与构建产物
+node_modules/
+dist/
+
+# 本地凭证（uTools 应用ID/插件密钥，勿提交）
+.utools.local.json
+
+# 日志与系统文件
+*.log
+.DS_Store
+Thumbs.db

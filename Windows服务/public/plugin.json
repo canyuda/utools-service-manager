@@ -1,0 +1,128 @@
+{
+  "main": "index.html",
+  "preload": "preload/services.js",
+  "logo": "logo.png",
+  "development": {
+    "main": "http://localhost:5173"
+  },
+  "pluginSetting": {
+    "single": true,
+    "height": 544
+  },
+  "features": [
+    {
+      "code": "service-manager",
+      "explain": "管理指定的 Windows 服务：实时状态、启停控制、启动类型修改",
+      "description": "管理指定的 Windows 服务：实时状态、启停控制、启动类型修改",
+      "platform": "win32",
+      "cmds": [
+        "服务管理",
+        "服务",
+        "services",
+        "svc"
+      ]
+    }
+  ],
+  "tools": {
+    "list_managed_services": {
+      "description": "列出本插件管理的 Windows 服务白名单及其实时状态。返回 { ok, count, services: [{ name, displayName, state, startType, acceptPause }] }；state 取值 Running/Stopped/Paused/StartPending/StopPending，startType 取值 auto/delayed-auto/demand/disabled。白名单为空时返回空数组。",
+      "inputSchema": { "type": "object", "additionalProperties": false }
+    },
+    "search_services": {
+      "description": "按名称或显示名搜索本机全部 Windows 服务（不限于白名单）。入参 { query } 为搜索关键字，不区分大小写的子串匹配；query 为空或省略时返回全部服务。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "description": "搜索关键字，可空" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "get_service_detail": {
+      "description": "查询单个 Windows 服务详情：状态、启动类型、描述、二进制路径、运行账户、是否支持暂停(acceptPause)。入参 { name } 为服务名（如 Redis、Consul，不是显示名）。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "服务名" }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+      }
+    },
+    "start_service": {
+      "description": "启动一个 Windows 服务。入参 { name } 为服务名。返回 { ok, service, state }；ok=false 时含 errorCode 与中文 message（如权限不足提示）。需要用户已在插件设置中开启 Agent 控制与写操作权限。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "服务名" }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+      }
+    },
+    "stop_service": {
+      "description": "停止一个 Windows 服务。入参 { name } 为服务名。需要用户已在插件设置中开启 Agent 控制与写操作权限。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "服务名" }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+      }
+    },
+    "restart_service": {
+      "description": "重启一个 Windows 服务（先停止、等待完全停止后再启动，最长约 15 秒）。入参 { name } 为服务名。需要用户已在插件设置中开启 Agent 控制与写操作权限。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "服务名" }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+      }
+    },
+    "pause_service": {
+      "description": "暂停一个支持暂停的 Windows 服务（多数服务不支持，可先用 get_service_detail 查看 acceptPause）。入参 { name } 为服务名。需要用户已在插件设置中开启 Agent 控制与写操作权限。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "服务名" }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+      }
+    },
+    "resume_service": {
+      "description": "恢复一个已暂停的 Windows 服务。入参 { name } 为服务名。需要用户已在插件设置中开启 Agent 控制与写操作权限。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "服务名" }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+      }
+    },
+    "set_service_start_type": {
+      "description": "修改 Windows 服务的启动类型。入参 { name, startType }；startType 取值：auto(自动)、delayed-auto(自动延迟启动)、demand(手动)、disabled(禁用)。需要用户已在插件设置中开启 Agent 控制与写操作权限。",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "服务名" },
+          "startType": {
+            "type": "string",
+            "enum": ["auto", "delayed-auto", "demand", "disabled"],
+            "description": "目标启动类型"
+          }
+        },
+        "required": ["name", "startType"],
+        "additionalProperties": false
+      }
+    },
+    "storage_debug": {
+      "description": "诊断工具：返回插件本地存储在两个后端（dbStorage 键值库 / db 文档库）中白名单、设置、审计键的原始内容，仅用于排查数据持久化问题，不修改任何数据。",
+      "inputSchema": { "type": "object", "additionalProperties": false }
+    }
+  }
+}
