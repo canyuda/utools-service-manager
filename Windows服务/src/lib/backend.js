@@ -58,6 +58,31 @@ function demoBackend () {
       return this.control(name, 'start')
     },
     async isAdmin () { await sleep(50); return false },
+    // 演示模式：Redis 默认已授权，其余未授权，便于预览授权流程
+    async pollStatuses (names) { return this.getStatuses(names) },
+    async checkAuth (names) {
+      await sleep(50)
+      const granted = db.get('granted', ['Redis'])
+      const out = {}
+      names.forEach(n => { out[n] = granted.includes(n) })
+      return out
+    },
+    async grantAuth (names) {
+      await sleep(600)
+      const granted = db.get('granted', ['Redis'])
+      names.forEach(n => { if (!granted.includes(n)) granted.push(n) })
+      db.set('granted', granted)
+      return { ok: true, results: names.map(n => ({ name: n, ok: true })) }
+    },
+    async revokeAuth (names) {
+      await sleep(300)
+      const granted = db.get('granted', ['Redis'])
+      db.set('granted', granted.filter(n => !names.includes(n)))
+      return { ok: true, results: names.map(n => ({ name: n, ok: true })) }
+    },
+    async getAuthBackups () {
+      return Object.fromEntries(db.get('granted', ['Redis']).map(n => [n, 'DEMO']))
+    },
     async getWhitelist () { return db.get('wl', [{ name: 'Redis', displayName: 'Redis' }, { name: 'Consul', displayName: 'Consul' }, { name: 'nginx', displayName: 'nginx' }]) },
     async saveWhitelist (list) { db.set('wl', list) },
     async getSettings () { return Object.assign({ mcpEnabled: false, mcpWriteEnabled: false }, db.get('settings', {})) },
@@ -75,11 +100,16 @@ function demoBackend () {
 function wrapReal (api) {
   return {
     getStatuses: (names) => api.getServicesStatus(names),
+    pollStatuses: (names) => api.pollStatuses(names),
     listAll: () => api.listAllServices(),
     control: (name, action) => api.control(name, action),
     setStartType: (name, t) => api.setStartType(name, t),
     restart: (name) => api.restartService(name),
     isAdmin: () => api.isAdmin(),
+    checkAuth: (names) => api.checkAuth(names),
+    grantAuth: (names) => api.grantAuth(names),
+    revokeAuth: (names) => api.revokeAuth(names),
+    getAuthBackups: () => api.getAuthBackups(),
     getWhitelist: () => api.getWhitelist(),
     saveWhitelist: (list) => api.saveWhitelist(list),
     getSettings: () => api.getSettings(),

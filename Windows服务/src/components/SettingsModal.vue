@@ -7,9 +7,10 @@ const props = defineProps({
   demo: { type: Boolean, default: false },
   preloadBuild: { type: String, default: '' },
   storageDiag: { type: Object, default: null },
-  uiBuild: { type: String, default: '' }
+  uiBuild: { type: String, default: '' },
+  authNames: { type: Array, default: () => [] }   // 已授权（有备份）的服务名
 })
-const emit = defineEmits(['close', 'save', 'clear-audit'])
+const emit = defineEmits(['close', 'save', 'clear-audit', 'revoke'])
 
 const fmtTime = (ts) => new Date(ts).toLocaleString('zh-CN', { hour12: false })
 const shortInput = (input) => {
@@ -48,9 +49,22 @@ const auditRows = computed(() => props.audit || [])
           </div>
           <div class="txt">
             <div class="t">允许 Agent 写操作</div>
-            <div class="d">允许 Agent 启动/停止/重启服务、暂停/恢复、修改启动类型。关闭时 Agent 只能查询。写操作受系统管理员权限限制。</div>
+            <div class="d">允许 Agent 启动/停止/重启服务、暂停/恢复、修改启动类型。关闭时 Agent 只能查询。目标服务需已在主界面完成「管理授权」。</div>
           </div>
         </div>
+
+        <div class="section-title">
+          服务管理授权（{{ authNames.length }}）
+          <span class="clear" v-if="authNames.length" @click="authNames.forEach(n => emit('revoke', n))">全部撤销</span>
+        </div>
+        <div class="auth-list" v-if="authNames.length">
+          <div v-for="n in authNames" :key="n" class="auth-item">
+            <span>{{ n }}</span>
+            <span class="revoke" @click="emit('revoke', n)">撤销</span>
+          </div>
+        </div>
+        <div class="audit-empty" v-else>暂无授权记录（以管理员身份运行 uTools 时无需授权）</div>
+        <div class="auth-note">授权把当前用户加入服务的访问控制（可启动/停止/修改启动类型），原安全描述符已备份，可随时撤销；服务重装或系统重置后授权会失效，需重新授权。</div>
 
         <div class="section-title">
           工具调用审计（最近 50 条）

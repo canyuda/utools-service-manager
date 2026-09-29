@@ -9,9 +9,10 @@ const props = defineProps({
   busy: { type: Boolean, default: false },
   expanded: { type: Boolean, default: false },
   changed: { type: Boolean, default: false },
-  loading: { type: Boolean, default: false }  // 首次状态查询尚未完成
+  loading: { type: Boolean, default: false },  // 首次状态查询尚未完成
+  authed: { type: Boolean, default: true }     // false = 未授权，控制按钮锁定
 })
-const emit = defineEmits(['toggle', 'action', 'restart', 'settype', 'remove'])
+const emit = defineEmits(['toggle', 'action', 'restart', 'settype', 'authorize', 'remove'])
 
 const PENDING_WORD = { StartPending: '正在启动…', StopPending: '正在停止…' }
 
@@ -36,7 +37,7 @@ const stateWordClass = computed(() => (['StartPending', 'StopPending'].includes(
 // 操作可用性矩阵：Running→停止/重启(+可暂停时暂停)；Paused→停止/恢复/重启；Stopped→启动
 const legal = computed(() => {
   const st = props.info && props.info.state
-  if (props.busy || !exists.value) return []
+  if (props.busy || !exists.value || !props.authed) return []
   if (st === 'Running') return props.info.acceptPause ? ['stop', 'pause', 'restart'] : ['stop', 'restart']
   if (st === 'Paused') return ['stop', 'resume', 'restart']
   if (st === 'Stopped') return ['start']
@@ -82,8 +83,12 @@ const typeText = computed(() => START_TYPE_TEXT[props.info?.startType] || props.
         <template v-else>{{ typeText }}</template>
       </span>
       <span class="acts" @click.stop>
-        <button v-for="o in inlineOps" :key="o.k" class="op" :class="o.k" :disabled="busy"
-                :title="o.label" @click="o.restart ? emit('restart') : emit('action', o.action)">{{ o.icon }}</button>
+        <button v-if="!authed" class="op auth-chip" :disabled="busy"
+                title="弹出 UAC 一次性授权后即可控制此服务" @click="emit('authorize')">🔒 未授权</button>
+        <template v-else>
+          <button v-for="o in inlineOps" :key="o.k" class="op" :class="o.k" :disabled="busy"
+                  :title="o.label" @click="o.restart ? emit('restart') : emit('action', o.action)">{{ o.icon }}</button>
+        </template>
       </span>
     </div>
 
@@ -97,10 +102,14 @@ const typeText = computed(() => START_TYPE_TEXT[props.info?.startType] || props.
         <div class="kv" v-if="info?.description"><span class="k">描述</span><span class="v">{{ info.description }}</span></div>
         <div class="kv" v-if="info?.binPath"><span class="k">二进制</span><span class="v">{{ info.binPath }}</span></div>
         <div class="kv" v-if="info?.account"><span class="k">账户</span><span class="v">{{ info.account }}</span></div>
+        <div class="kv" v-if="!authed">
+          <span class="k">控制权限</span>
+          <span class="v">未授权 —— <a class="auth-link" @click="emit('authorize')">点击授权（UAC 确认，一次性）</a></span>
+        </div>
         <div class="kv">
           <span class="k">启动类型</span>
           <span class="v" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-            <select class="starttype" :disabled="busy" :value="typeText" @change="onTypeChange">
+            <select class="starttype" :disabled="busy || !authed" :value="typeText" @change="onTypeChange">
               <option v-for="(t, k) in START_TYPE_TEXT" :key="k">{{ t }}</option>
             </select>
             <span v-if="pendingType" class="confirm-type" :class="{ danger: pendingType === 'disabled' }">
@@ -112,7 +121,7 @@ const typeText = computed(() => START_TYPE_TEXT[props.info?.startType] || props.
         </div>
         <div class="ops">
           <button v-for="o in OPS" :key="o.k" class="op big" :class="o.k"
-                  :disabled="busy || !legal.includes(o.k)"
+                  :disabled="busy || !authed || !legal.includes(o.k)"
                   @click="o.restart ? emit('restart') : emit('action', o.action)">{{ o.icon }} {{ o.label }}</button>
         </div>
         <div class="foot">

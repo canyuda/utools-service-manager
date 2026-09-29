@@ -5,7 +5,9 @@
 // 向渲染进程暴露 window.svcApi；插件初始化时通过 utools.registerTool 注册 MCP 工具。
 const { execFile } = require('child_process')
 const fs = require('fs')
+const os = require('os')
 const path = require('path')
+const P = require('./svc-parse.js')
 
 /* ---------------- 临时诊断日志（排障用，后续版本移除） ---------------- */
 const LOG_FILE = path.join(process.env.TEMP || process.env.TMP || '.', 'svc-plugin-debug.log')
@@ -63,7 +65,7 @@ function parseJsonOut (stdout) {
 /* ---------------- 错误码映射（设计文档 §7.2） ---------------- */
 const ERR_TEXT = {
   0: '成功',
-  5: '权限不足：请以管理员身份运行 uTools 后重试',
+  5: '权限不足：请先在插件中完成该服务的「管理授权」（UAC 确认）；系统保护服务授权后也可能拒绝',
   1051: '该服务正被其他运行中的服务依赖，无法停止',
   1052: '该服务不接受暂停/恢复操作',
   1053: '服务未及时响应启动或停止请求',
@@ -147,6 +149,22 @@ ConvertTo-Json -InputObject @($out) -Compress
   return (Array.isArray(rows) ? rows : [rows]).map(normalizeSvc).filter(x => x && x.exists)
 }
 
+/* ---------------- 状态轮询（sc.exe 轻量热路径） ---------------- */
+// 2 秒热路径不用 PowerShell：一次 `sc query state= all` 覆盖全量服务状态（单进程、开销约几十 ms），
+// 按白名单过滤返回；启动类型/显示名等完整信息仍走 getServicesStatus（用户触发的冷路径）。
+async function pollStatuses (names) {
+  const want = new Set((names || []).map(String))
+  if (!want.size) return []
+  const { stdout } = await run('sc.exe', ['query', 'state=', 'all'])
+  return P.parseScQueryAll(stdout).filter(r => want.has(r.name))
+}
+
+// 单服务轻量状态查询（重启等待循环 / MCP 返回状态用，替代原来每 800ms 拉一次 PowerShell）
+async function quickState (name) {
+  const { stdout } = await run('sc.exe', ['query', name])
+  return P.parseScQueryOne(stdout)
+}
+
 /* ---------------- 服务控制（sc.exe） ---------------- */
 // sc config 语法要求 "start= auto"（= 后必须有空格），argv 数组拼出的命令行恰好是该形式
 async function control (name, action) {
@@ -174,8 +192,8 @@ async function restartService (name) {
   const t0 = Date.now()
   for (;;) {
     await new Promise(r => setTimeout(r, 800))
-    const st = (await getServicesStatus([name]))[0]
-    if (!st || !st.exists || st.state === 'Stopped') break
+    const st = await quickState(name)
+    if (!st || st.state === 'Stopped') break
     if (Date.now() - t0 > 15000) {
       return { ok: false, errorCode: 1053, message: ERR_TEXT[1053] + '（等待停止超时）' }
     }
@@ -187,8 +205,114 @@ async function isAdmin () {
   return (await run('net', ['session'], 8000)).code === 0
 }
 
+/* ---------------- 按服务授权（SDDL 追加当前用户 ACE，UAC 提权执行） ---------------- */
+// 插件本体不要求管理员：授权后的服务，普通身份即可启动/停止/暂停/改启动类型（含 MCP 写操作）。
+// 原安全描述符备份在 K.auth，撤销时经 UAC 还原为授权时刻的原串。
+// 用绝对路径：避免类 Unix 环境（Git Bash 等）里 coreutils 的 whoami 抢占 PATH
+const WHOAMI_EXE = path.join(process.env.SystemRoot || process.env.windir || 'C:\\Windows', 'System32', 'whoami.exe')
+let sidCache = null
+async function getUserSid () {
+  if (sidCache) return sidCache
+  const { stdout } = await run(WHOAMI_EXE, ['/user', '/fo', 'csv', '/nh'])
+  sidCache = P.parseWhoamiSid(stdout)
+  return sidCache
+}
+
+// 批量检查授权状态 → { [name]: bool }。管理员全真；否则逐个 sdshow 看当前用户是否拥有 RP+WP+DC
+async function checkAuth (names) {
+  const list = [...new Set((names || []).map(String))].filter(Boolean)
+  const out = {}
+  if (!list.length) return out
+  if (await isAdmin()) {
+    for (const n of list) out[n] = true
+    return out
+  }
+  const sid = await getUserSid()
+  if (!sid) {
+    // 拿不到 SID 时不拦界面；真正执行写操作失败（error 5）时由界面兜底纠正
+    for (const n of list) out[n] = true
+    return out
+  }
+  await Promise.all(list.map(async (n) => {
+    const { code, stdout } = await run('sc.exe', ['sdshow', n])
+    const sddl = code === 0 ? P.extractSddl(stdout) : null
+    out[n] = !!sddl && P.sddlHasRights(sddl, sid, ['RP', 'WP', 'DC'])
+  }))
+  return out
+}
+
+function tempPath (ext) {
+  return path.join(os.tmpdir(), 'svc-auth-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '.' + ext)
+}
+
+// 写任务文件 → UAC 拉起提权 PS 执行 AUTH_PS1 → 读回结果文件。
+// exit 1252 = UAC 被取消/提权失败；结果文件缺失同义。
+async function runElevatedAuth (job) {
+  const jobPath = tempPath('job.json')
+  const resultPath = tempPath('result.json')
+  const scriptPath = tempPath('auth.ps1')
+  fs.writeFileSync(jobPath, JSON.stringify(job), 'utf8')
+  // BOM 让 Windows PowerShell 5 按 UTF-8 读取（脚本含中文报错文案）
+  fs.writeFileSync(scriptPath, '\ufeff' + P.AUTH_PS1, 'utf8')
+  const q = (s) => String(s).replace(/'/g, "''")
+  const launcher = "$ErrorActionPreference='Stop'; try { $p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','" + q(scriptPath) + "','-JobPath','" + q(jobPath) + "','-ResultPath','" + q(resultPath) + "'; exit $p.ExitCode } catch { exit 1252 }"
+  try {
+    const { code } = await runPs(launcher, 120000)
+    let res = null
+    try { res = JSON.parse(fs.readFileSync(resultPath, 'utf8').replace(/^\uFEFF/, '')) } catch (e) { /* 无结果文件 = UAC 未确认或脚本未执行 */ }
+    if (!res) {
+      return code === 1252
+        ? { ok: false, cancelled: true, message: '已取消：未在 UAC 窗口中确认授权' }
+        : { ok: false, message: '授权未完成：UAC 提权失败（错误码 ' + code + '）' }
+    }
+    return res
+  } finally {
+    for (const f of [jobPath, resultPath, scriptPath]) { try { fs.unlinkSync(f) } catch (e) { /* ignore */ } }
+  }
+}
+
+async function grantAuth (names) {
+  const list = [...new Set((names || []).map(String))].filter(Boolean)
+  if (!list.length) return { ok: true, results: [] }
+  const sid = await getUserSid()
+  if (!sid) return { ok: false, message: '无法获取当前用户 SID，无法授权' }
+  const res = await runElevatedAuth({ services: list, sid })
+  const backups = dbGet(K.auth, {})
+  let changed = false
+  for (const x of ((res && res.results) || [])) {
+    if (x.ok && x.before) { backups[x.name] = x.before; changed = true }
+  }
+  if (changed) dbSet(K.auth, backups)
+  return res
+}
+
+async function revokeAuth (names) {
+  const list = [...new Set((names || []).map(String))].filter(Boolean)
+  const backups = dbGet(K.auth, {})
+  const have = {}
+  const missing = []
+  for (const n of list) {
+    if (backups[n]) have[n] = backups[n]
+    else missing.push(n)
+  }
+  const results = missing.map(n => ({ name: n, ok: false, error: '未找到授权备份，无法安全撤销' }))
+  if (Object.keys(have).length) {
+    const r = await runElevatedAuth({ revoke: true, backups: have })
+    results.push(...((r && r.results) || []))
+    if (r && r.ok) {
+      for (const n of Object.keys(have)) delete backups[n]
+      dbSet(K.auth, backups)
+    } else {
+      return { ok: false, results }
+    }
+  }
+  return { ok: missing.length === 0, results }
+}
+
+function getAuthBackups () { return dbGet(K.auth, {}) }
+
 /* ---------------- 持久化（utools.dbStorage） ---------------- */
-const K = { wl: 'svc_whitelist', settings: 'svc_settings', audit: 'svc_audit' }
+const K = { wl: 'svc_whitelist', settings: 'svc_settings', audit: 'svc_audit', auth: 'svc_auth_backup' }
 const DEFAULT_SETTINGS = { mcpEnabled: false, mcpWriteEnabled: false }
 
 /* ---- 持久化双后端（与渲染进程 store.js 同策略）：dbStorage + utools.db 文档库 ---- */
@@ -277,7 +401,7 @@ function guard (write) {
 
 async function stateAfterOk (name, r) {
   if (!r.ok) return r
-  const st = (await getServicesStatus([name]))[0]
+  const st = await quickState(name)
   return Object.assign(r, { service: name, state: st ? st.state : undefined })
 }
 
@@ -372,23 +496,28 @@ function storageDump () {
   return out
 }
 
-appendLog('preload 加载 build=preload-2026-09-24-a via=' + utoolsVia() +
+appendLog('preload 加载 build=preload-2026-09-29-a via=' + utoolsVia() +
   ' hasDbStorage=' + !!(utoolsApi() && utoolsApi().dbStorage) +
   ' hasDb=' + !!(utoolsApi() && utoolsApi().db))
 registerMcpToolsWithRetry(0)
 
 /* ---------------- 向渲染进程暴露接口 ---------------- */
 window.svcApi = {
-  BUILD: 'preload-2026-09-24-a',
+  BUILD: 'preload-2026-09-29-a',
   debugLog: (line) => appendLog('[ui] ' + line),
   storageRead: (key) => dbGet(key, null),
   storageWrite: (key, val) => dbSet(key, val),
   getServicesStatus,
+  pollStatuses,
   listAllServices,
   control,
   setStartType,
   restartService,
   isAdmin,
+  checkAuth,
+  grantAuth,
+  revokeAuth,
+  getAuthBackups,
   getWhitelist,
   saveWhitelist,
   getSettings,

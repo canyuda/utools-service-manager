@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "build:watch": "vite build --watch"
+    "build:watch": "vite build --watch",
+    "test": "node test/svc-parse.test.cjs"
   },
   "dependencies": {
     "vue": "^3.5.13"
