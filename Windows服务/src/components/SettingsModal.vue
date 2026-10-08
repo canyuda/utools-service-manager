@@ -10,7 +10,7 @@ const props = defineProps({
   uiBuild: { type: String, default: '' },
   authNames: { type: Array, default: () => [] }   // 已授权（有备份）的服务名
 })
-const emit = defineEmits(['close', 'save', 'clear-audit', 'revoke'])
+const emit = defineEmits(['close', 'save', 'clear-audit', 'revoke', 'revoke-all'])
 
 const fmtTime = (ts) => new Date(ts).toLocaleString('zh-CN', { hour12: false })
 const shortInput = (input) => {
@@ -55,7 +55,8 @@ const auditRows = computed(() => props.audit || [])
 
         <div class="section-title">
           服务管理授权（{{ authNames.length }}）
-          <span class="clear" v-if="authNames.length" @click="authNames.forEach(n => emit('revoke', n))">全部撤销</span>
+          <!-- 批量撤销走单次事件：一次 UAC + 原子更新备份库；逐个 emit 会并发跑多个 UAC 且互相覆盖备份 -->
+          <span class="clear" v-if="authNames.length" @click="emit('revoke-all')">全部撤销</span>
         </div>
         <div class="auth-list" v-if="authNames.length">
           <div v-for="n in authNames" :key="n" class="auth-item">

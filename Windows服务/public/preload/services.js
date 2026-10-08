@@ -286,7 +286,15 @@ async function grantAuth (names) {
   return res
 }
 
-async function revokeAuth (names) {
+// 串行化撤销：内部是「读全部备份 → 删本次的 → 整体写回」，并发调用会拿同一份旧快照
+// 互相覆盖（后完成者把先完成者已删的备份写回去），必须排队执行
+let revokeSeq = Promise.resolve()
+function revokeAuth (names) {
+  const run = revokeSeq.then(() => doRevokeAuth(names))
+  revokeSeq = run.then(() => {}, () => {})
+  return run
+}
+async function doRevokeAuth (names) {
   const list = [...new Set((names || []).map(String))].filter(Boolean)
   const backups = dbGet(K.auth, {})
   const have = {}
@@ -297,7 +305,9 @@ async function revokeAuth (names) {
   }
   const results = missing.map(n => ({ name: n, ok: false, error: '未找到授权备份，无法安全撤销' }))
   if (Object.keys(have).length) {
-    const r = await runElevatedAuth({ revoke: true, backups: have })
+    // services 必须传：AUTH_PS1 的 foreach 以 @($job.services) 迭代，缺省会以 $null
+    // 迭代一次并在 $backups.PSObject.Properties[$null] 上抛「索引操作失败」
+    const r = await runElevatedAuth({ revoke: true, services: Object.keys(have), backups: have })
     results.push(...((r && r.results) || []))
     if (r && r.ok) {
       for (const n of Object.keys(have)) delete backups[n]

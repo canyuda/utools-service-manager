@@ -76,4 +76,26 @@ assert.ok(P.AUTH_PS1.includes('ConvertTo-Json'))
 assert.ok(!/[`]/.test(P.AUTH_PS1), 'PS1 不得含反引号（避免转义问题）')
 assert.ok(!/\$\{/.test(P.AUTH_PS1), 'PS1 不得含 ${（避免被当作插值）')
 
+/* ---- 撤销 job 契约：必须带 services 数组，缺省会让 AUTH_PS1 以 $null 迭代一次 ----
+   复现线上 bug「撤销失败：索引操作失败；数组索引的计算结果为 Null」：
+   @($null) 是含一个 $null 元素的数组，$backups.PSObject.Properties[$null] 即抛该错。
+   services.js 构造撤销 job 时必须同时传 services 与 backups。 */
+{
+  const { execFileSync } = require('child_process')
+  const ps = [
+    '$bad = \'{"revoke":true,"backups":{"Redis":"D:(A;;RP;;;BA)"}}\' | ConvertFrom-Json',
+    '$badErr = $false',
+    'try { foreach ($n in @($bad.services)) { $null = $bad.backups.PSObject.Properties[$n].Value } } catch { $badErr = $true }',
+    '$good = \'{"revoke":true,"services":["Redis"],"backups":{"Redis":"D:(A;;RP;;;BA)"}}\' | ConvertFrom-Json',
+    '$goodVal = \'\'',
+    'try { foreach ($n in @($good.services)) { $goodVal = [string]$good.backups.PSObject.Properties[$n].Value } } catch { $goodVal = \'ERR\' }',
+    '"BAD_ERR=" + $badErr',
+    '"GOOD_VAL=" + $goodVal'
+  ].join('\n')
+  const enc = Buffer.from(ps, 'utf16le').toString('base64')
+  const out = execFileSync('powershell.exe', ['-NoProfile', '-EncodedCommand', enc], { encoding: 'utf8', timeout: 30000 })
+  assert.ok(out.includes('BAD_ERR=True'), '缺 services 的撤销 job 必须复现索引报错：\n' + out)
+  assert.ok(out.includes('GOOD_VAL=D:(A;;RP;;;BA)'), '带 services 的撤销 job 应能取回备份 SDDL：\n' + out)
+}
+
 console.log('ALL PASS:', rows.length, 'blocks parsed,', Object.keys(P).length, 'exports verified')

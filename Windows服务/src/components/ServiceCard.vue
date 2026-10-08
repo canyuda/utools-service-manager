@@ -125,7 +125,7 @@ const typeText = computed(() => START_TYPE_TEXT[props.info?.startType] || props.
                   @click="o.restart ? emit('restart') : emit('action', o.action)">{{ o.icon }} {{ o.label }}</button>
         </div>
         <div class="foot">
-          <span style="font-size:11.5px;color:var(--sub)">每 2 秒自动刷新</span>
+          <span style="font-size:11.5px;color:var(--sub)">进入/聚焦时自动刷新</span>
           <span class="remove"><a @click="emit('remove')">从列表移除</a></span>
         </div>
       </template>

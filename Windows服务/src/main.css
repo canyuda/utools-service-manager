@@ -60,7 +60,8 @@ body {
 .ftab:hover { background: var(--hover); }
 .ftab.on { background: var(--active); color: var(--blue); font-weight: 600; }
 .ftab .n { opacity: .75; margin-left: 2px; }
-.filterbar .refresh { margin-left: auto; font-size: 12px; }
+.filterbar .refresh { margin-left: auto; font-size: 12px; cursor: pointer; user-select: none; }
+.filterbar .refresh:hover { color: var(--blue); }
 
 /* ============ 卡片（布局 A） ============ */
 .cards { flex: 1; min-height: 0; overflow-y: auto; padding: 2px 16px 16px; }

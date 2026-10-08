@@ -66,7 +66,9 @@ function bBridge () {
     write (k, v) {
       const ok = a.storageWrite(k, v)
       if (!ok) throw new Error('桥写入返回 false（preload 侧双后端均失败，详见插件控制台 [svc] 日志）')
-    }
+    },
+    // svcApi 没有删除接口；写 null 即逻辑删除（读侧把 null 当无数据）
+    del (k) { a.storageWrite(k, null) }
   }
 }
 

@@ -1,6 +1,6 @@
 # Windows 服务管理（uTools 插件工程）
 
-管理指定的 Windows 服务：实时状态（2s 轮询）、启动/停止/暂停/恢复/重启、启动类型修改（自动/自动延迟/手动/禁用），并通过 uTools MCP 让 Claude Code 等 AI Agent 直接操作服务。设计文档见上级 [docs/2026-09-23-ui-design.md](../docs/2026-09-23-ui-design.md)。
+管理指定的 Windows 服务：状态刷新（事件驱动，无后台轮询）、启动/停止/暂停/恢复/重启、启动类型修改（自动/自动延迟/手动/禁用），并通过 uTools MCP 让 Claude Code 等 AI Agent 直接操作服务。设计文档见上级 [docs/2026-09-23-ui-design.md](../docs/2026-09-23-ui-design.md)。
 
 ## 目录结构
 
@@ -56,4 +56,4 @@ set_service_start_type { "name": "Redis", "startType": "disabled" }
 
 - `npm run build` 产物完整（dist 含 plugin.json / preload / index.html / logo）。
 - 服务查询层本机冒烟通过：`getServicesStatus`（Redis/Consul/nginx 状态与启动类型正确、不存在服务返回 exists:false）、`listAllServices`（310 个）、`isAdmin`（非管理员返回 false，对应顶栏横幅）。
-- 未验证（需要 uTools 环境与用户操作）：启停写操作、MCP 工具调用、真机轮询体验。
+- 未验证（需要 uTools 环境与用户操作）：启停写操作、MCP 工具调用、真机刷新体验。

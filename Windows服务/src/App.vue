@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import ServiceCard from './components/ServiceCard.vue'
 import AddServiceView from './components/AddServiceView.vue'
 import SettingsModal from './components/SettingsModal.vue'
@@ -27,7 +27,6 @@ const settingsOpen = ref(false)
 const audit = ref([])
 const toasts = ref([])
 let toastId = 0
-let timer = null
 
 /* ---------- Toast ---------- */
 function toast (msg, type = 'info') {
@@ -46,7 +45,7 @@ function applyTheme () {
   document.documentElement.dataset.theme = dark ? 'dark' : 'light'
 }
 
-/* ---------- 初始化 / 轮询 ---------- */
+/* ---------- 初始化 / 刷新 ---------- */
 async function init () {
   applyTheme()
   try {
@@ -60,7 +59,6 @@ async function init () {
   } catch (e) {
     toast('初始化失败：' + (e && e.message), 'error')
   }
-  startPoll()
 }
 /* 全量刷新（PowerShell 冷路径）：仅进入插件时调用，取启动类型/显示名等完整信息 */
 async function refreshStatuses () {
@@ -80,7 +78,10 @@ async function refreshStatuses () {
     live[r.name] = r
   }
 }
-/* 轻量轮询（sc.exe 热路径，2 秒一次）：只刷新状态/可暂停位，与已缓存的完整信息合并 */
+/* 轻量刷新（sc.exe 热路径）：只刷新状态/可暂停位，与已缓存的完整信息合并。
+   不做后台定时轮询：uTools 隐藏/窗口遮挡时 Chromium 会冻结定时器，静置轮询既浪费
+   也会让界面停在过期帧（上架审核"无操作一段时间后卡死"根因）。改为事件驱动：
+   进入插件 / 窗口重新可见或聚焦 / 操作后 burst / 手动点刷新。 */
 async function pollTick () {
   const names = whitelist.value.map(w => w.name)
   if (!names.length) return
@@ -97,23 +98,22 @@ async function pollTick () {
     live[r.name] = Object.assign({}, live[r.name], r)
   }
 }
-function startPoll () { stopPoll(); timer = setInterval(pollTick, 2000) }
-function stopPoll () { if (timer) { clearInterval(timer); timer = null } }
 
 onMounted(() => {
   init()
-  // utools 桥可能晚于挂载注入：绑定插件生命周期做延迟重试
+  // utools 桥可能晚于挂载注入：绑定插件进入做延迟重试
   const bind = (attempt = 0) => {
     if (window.utools) {
       window.utools.onPluginEnter(() => init())
-      window.utools.onPluginOut(() => stopPoll())
     } else if (attempt < 40) {
       setTimeout(() => bind(attempt + 1), 250)
     }
   }
   bind()
+  // 回到插件（窗口重新可见/聚焦）时轻量刷新一次，替代原 2 秒轮询
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') pollTick() })
+  window.addEventListener('focus', pollTick)
 })
-onUnmounted(stopPoll)
 
 /* ---------- 操作 ---------- */
 /* 操作后立即刷新并连续追踪：立即 → 每 600ms 一次，直到状态脱离 pending（最多 8 次 ≈ 5s） */
@@ -264,12 +264,17 @@ async function grantAuth (names) {
   refreshAuthNames()
 }
 function grantAll () { grantAuth(unauthNames.value.slice()) }
-async function revokeOne (name) {
+async function revokeOne (name) { doRevoke([name]) }
+function revokeAll () { doRevoke(authNames.value.slice()) }
+/* 批量撤销：一次 UAC 完成全部，逐个 ok 的才更新 authMap；结束后重读备份库刷新列表 */
+async function doRevoke (list) {
+  if (!list.length) return
   try {
-    const r = await svc.revokeAuth([name])
-    if (r.ok) {
-      authMap[name] = false
-      toast(`已撤销 ${name} 的授权`, 'ok')
+    const r = await svc.revokeAuth(list)
+    const okNames = ((r && r.results) || []).filter(x => x.ok).map(x => x.name)
+    okNames.forEach(n => { authMap[n] = false })
+    if (r && r.ok) {
+      toast(list.length === 1 ? `已撤销 ${list[0]} 的授权` : `已撤销 ${okNames.length} 个服务的授权`, 'ok')
     } else {
       const fail = ((r && r.results) || []).find(x => !x.ok)
       toast(`撤销失败：${(fail && fail.error) || (r && r.message) || '未知错误'}`, 'error')
@@ -323,7 +328,7 @@ async function refreshAuthNames () {
         <span class="ftab" :class="{ on: filter === 'Running' }" @click="filter = 'Running'">运行中<span class="n">{{ counts.Running }}</span></span>
         <span class="ftab" :class="{ on: filter === 'Stopped' }" @click="filter = 'Stopped'">已停止<span class="n">{{ counts.Stopped }}</span></span>
         <span class="ftab" :class="{ on: filter === 'Paused' }" @click="filter = 'Paused'">已暂停<span class="n">{{ counts.Paused }}</span></span>
-        <span class="refresh">⟳ 每 2 秒自动刷新</span>
+        <span class="refresh" title="刷新状态（进入插件或窗口聚焦时也会自动刷新）" @click="pollTick">⟳ 刷新</span>
       </div>
       <div class="cards">
         <ServiceCard v-for="w in visibleList" :key="w.name"
@@ -343,7 +348,7 @@ async function refreshAuthNames () {
                    :preload-build="preloadBuild" :storage-diag="storageDiag" :ui-build="UI_BUILD"
                    :auth-names="authNames" :granting="granting"
                    @close="settingsOpen = false" @save="saveSettings" @clear-audit="audit = []; store.clearAudit()"
-                   @revoke="revokeOne" />
+                   @revoke="revokeOne" @revoke-all="revokeAll" />
 
     <div class="toasts">
       <div v-for="t in toasts" :key="t.id" class="toast" :class="t.type">{{ t.msg }}</div>
