@@ -21,13 +21,15 @@ uTools 插件：管理指定的 Windows 服务——实时状态、启停控制�
 
 ## 界面预览
 
+实际运行截图（v1.0.3，事件驱动刷新版界面）：
+
 | 主列表 | 展开详情 |
 | --- | --- |
-| ![主列表](docs/design-01-main-list.png) | ![展开详情](docs/design-02-detail-expanded.png) |
-| **添加服务** | **深色模式** |
-| ![添加服务](docs/design-03-add-service.png) | ![深色模式](docs/design-05-dark-mode.png) |
-| **备选布局 B：紧凑表格** | **备选布局 C：分栏主从** |
-| ![备选布局 B](docs/design-06-alt-variant-b.png) | ![备选布局 C](docs/design-07-alt-variant-c.png) |
+| ![主列表](docs/screenshots/01-main-list.png) | ![展开详情](docs/screenshots/02-detail-expanded.png) |
+| **添加服务** | **设置（MCP / 授权 / 审计）** |
+| ![添加服务](docs/screenshots/03-add-service.png) | ![设置](docs/screenshots/04-settings.png) |
+
+早期设计稿（含深色模式与备选布局）见 `docs/design-*.png`。
 
 ## MCP 集成：让 AI Agent 直接管理服务
 
