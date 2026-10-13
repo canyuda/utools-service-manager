@@ -13,6 +13,7 @@ const QUERY_ALL = [
   '        WIN32_EXIT_CODE    : 0  (0x0)',
   '',
   'SERVICE_NAME: SysMain',
+  '        DISPLAY_NAME: SysMain - 系统维护\r',
   '        TYPE               : 20  WIN32_SHARE_PROCESS ',
   '        STATE              : 4  RUNNING ',
   '                                (STOPPABLE, PAUSABLE, ACCEPTS_SHUTDOWN)',
@@ -22,6 +23,7 @@ const QUERY_ALL = [
   '        [SC] QueryServiceConfig \u6210\u529F', // 本地化尾行
   '',
   'SERVICE_NAME: WSearch',
+  '        DISPLAY_NAME: Windows Search',
   '        STATE              : 2  START_PENDING',
   '                                (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)'
 ].join('\n')
@@ -29,11 +31,39 @@ const QUERY_ALL = [
 const rows = P.parseScQueryAll(QUERY_ALL)
 assert.strictEqual(rows.length, 4, '应解析出 4 个服务块')
 assert.deepStrictEqual(rows[0], { name: 'Spooler', state: 'Running', acceptPause: false })
-assert.deepStrictEqual(rows[1], { name: 'SysMain', state: 'Running', acceptPause: true })
+assert.deepStrictEqual(rows[1], { name: 'SysMain', state: 'Running', acceptPause: true, displayName: 'SysMain - 系统维护' }, '应带出显示名（含 \r 剥离）')
+assert.strictEqual(rows[0].displayName, undefined, '无 DISPLAY_NAME 行时不产生该键')
+assert.strictEqual(rows[3].displayName, 'Windows Search')
 assert.strictEqual(rows[2].state, 'Stopped')
 assert.strictEqual(rows[3].state, 'StartPending')
 assert.deepStrictEqual(P.parseScQueryAll(''), [])
 assert.strictEqual(P.parseScQueryAll(null).length, 0)
+
+/* ---- parseRegDwordByName：reg query /s /v 输出 → { 服务名: 数值 } ---- */
+const REG_START = [
+  '',
+  'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\1394ohci',
+  '    Start    REG_DWORD    0x3',
+  '',
+  'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\ADPSvc',
+  '    Start    REG_DWORD    0x2',
+  '',
+  'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\W32Time\\Parameters',
+  '    Start    REG_DWORD    0x4',
+  '',
+  'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\NoValKey',
+  '    Type    REG_DWORD    0x10',
+  '',
+  '\u641C\u7D22\u7ED3\u675F: \u627E\u5230 713 \u5339\u914D\u3002' // 本地化尾行必须被跳过
+].join('\r\n')
+assert.deepStrictEqual(P.parseRegDwordByName(REG_START, 'Start'), {
+  '1394ohci': 3,
+  ADPSvc: 2,
+  'W32Time\\Parameters': 4 // 嵌套子键按完整段名索引，与 sc 枚举名对不上即被上层忽略
+}, '应解析 REG_DWORD 十六进制值并跳过无值键与本地化行')
+assert.deepStrictEqual(P.parseRegDwordByName(REG_START, 'Starttype'), {}, '值名不匹配应返回空')
+assert.deepStrictEqual(P.parseRegDwordByName('', 'Start'), {})
+assert.deepStrictEqual(P.parseRegDwordByName(null, 'Start'), {})
 
 /* ---- parseScQueryOne：单服务查询 ---- */
 const one = P.parseScQueryOne('SERVICE_NAME: nginx \n        STATE              : 7  PAUSED \n                                (STOPPABLE, PAUSABLE, IGNORES_SHUTDOWN)')

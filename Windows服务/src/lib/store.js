@@ -1,7 +1,7 @@
 // 渲染进程侧持久化：四层后端依次兜底，写=所有后端尽力写（各带写后验证），读=依次读谁有数据用谁
 // 1) window.utools.dbStorage  2) window.utools.db 文档库  3) preload 桥(svcApi 转发)  4) localStorage
 // 任一后端失败都会把具体错误带回给调用方展示
-export const BUILD = 'ui-2026-09-24-c'
+export const BUILD = 'ui-2026-10-13-a'
 
 const KEYS = {
   wl: 'svc_whitelist',

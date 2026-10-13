@@ -15,7 +15,8 @@ const SC_STATE_WORD = {
   CONTINUE_PENDING: 'ContinuePending'
 }
 
-// 解析 `sc query` / `sc query state= all` 输出 → [{ name, state, acceptPause }]
+// 解析 `sc query` / `sc query state= all` 输出 → [{ name, displayName?, state, acceptPause }]
+// DISPLAY_NAME 行的显示名是注册表数据（非 ASCII 时为系统码页字节），调用方负责先按码页解码
 function parseScQueryBlocks (stdout) {
   const rows = []
   if (!stdout) return rows
@@ -27,14 +28,39 @@ function parseScQueryBlocks (stdout) {
     if (!name) continue
     const sm = /STATE[ \t]*:[ \t]*\d+[ \t]+([A-Z_]+)/.exec(block)
     if (!sm) continue
-    rows.push({
+    const dm = /^[ \t]*DISPLAY_NAME:[ \t]*(.*)$/m.exec(block)
+    const row = {
       name,
       state: SC_STATE_WORD[sm[1]] || sm[1],
       // \bPAUSABLE\b 不会误匹配 NOT_PAUSABLE（下划线是词字符，无边界）
       acceptPause: /\bPAUSABLE\b/.test(block)
-    })
+    }
+    if (dm && dm[1].trim()) row.displayName = dm[1].trim()
+    rows.push(row)
   }
   return rows
+}
+
+/* ---------------- reg.exe 输出解析 ---------------- */
+// 解析 `reg query HKLM\SYSTEM\CurrentControlSet\Services /s /v <ValName>` 输出
+// → { 键名: REG_DWORD 数值 }。键名取 Services\ 下的段（含嵌套子键如 X\Parameters，
+// 无 Start 值的键不出现，子键即使出现也只按完整段名索引，与 sc 枚举名对不上即被忽略）。
+// 首尾的本地化提示行（如"搜索结束: 找到 N 匹配。"）不匹配任何正则，天然跳过。
+function parseRegDwordByName (stdout, valName) {
+  const out = {}
+  if (!stdout) return out
+  let key = null
+  const keyRe = /^HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\(.+)$/i
+  const valRe = new RegExp('^' + valName + '[ \\t]+REG_DWORD[ \\t]+0x([0-9a-f]+)$', 'i')
+  for (const line of String(stdout).split(/\r?\n/)) {
+    const t = line.trim()
+    if (!t) continue
+    const km = keyRe.exec(t)
+    if (km) { key = km[1]; continue }
+    const vm = valRe.exec(t)
+    if (vm && key) out[key] = parseInt(vm[1], 16)
+  }
+  return out
 }
 
 function parseScQueryAll (stdout) { return parseScQueryBlocks(stdout) }
@@ -133,6 +159,7 @@ module.exports = {
   SC_STATE_WORD,
   parseScQueryAll,
   parseScQueryOne,
+  parseRegDwordByName,
   extractSddl,
   sddlHasRights,
   sddlInsertAce,

@@ -9,16 +9,26 @@ const emit = defineEmits(['back', 'add', 'remove'])
 
 const rows = ref(null)   // null=加载中
 const loadError = ref('')
+const slowHint = ref(false)
 const q = ref('')
+let slowTimer = null
 
-onMounted(async () => {
+async function load () {
+  rows.value = null
+  loadError.value = ''
+  slowHint.value = false
+  clearTimeout(slowTimer)
+  slowTimer = setTimeout(() => { slowHint.value = true }, 5000)
   try {
     rows.value = await svc.listAll()
   } catch (e) {
     rows.value = []
     loadError.value = '服务列表加载失败：' + ((e && e.message) || e)
+  } finally {
+    clearTimeout(slowTimer)
   }
-})
+}
+onMounted(load)
 
 const filtered = computed(() => {
   if (!rows.value) return []
@@ -36,9 +46,11 @@ const stateWord = (s) => ({ Running: '运行中', Stopped: '已停止', Paused: 
   <div class="addlist">
     <template v-if="rows === null">
       <div class="skel" v-for="i in 5" :key="i"></div>
+      <div class="audit-empty" v-if="slowHint">正在枚举系统服务，请稍候…</div>
     </template>
     <template v-else-if="loadError">
       <div class="audit-empty" style="color:var(--red)">{{ loadError }}</div>
+      <button class="btn" style="margin:0 auto" @click="load">重试</button>
     </template>
     <template v-else-if="!filtered.length">
       <div class="audit-empty">没有匹配的服务</div>

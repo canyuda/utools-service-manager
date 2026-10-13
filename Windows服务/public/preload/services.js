@@ -53,6 +53,45 @@ function runPs (script, timeout = PS_TIMEOUT) {
   return run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], timeout)
 }
 
+// 以 Buffer 取原始输出（控制台程序管道输出是系统码页字节，utf8 解码会毁掉中文显示名）
+function runBuf (cmd, args, timeout = RUN_TIMEOUT) {
+  return new Promise((resolve) => {
+    execFile(cmd, args, {
+      encoding: 'buffer',
+      timeout,
+      windowsHide: true,
+      maxBuffer: 10 * 1024 * 1024
+    }, (err, stdout) => {
+      if (err && typeof err.code !== 'number') {
+        return resolve({ code: -1, buf: Buffer.alloc(0) })
+      }
+      resolve({ code: err ? err.code : 0, buf: stdout || Buffer.alloc(0) })
+    })
+  })
+}
+
+// 按系统码页解码控制台输出：chcp 探测一次并缓存。zh-CN=936(gbk)、ja=932、ko=949、
+// 繁中=950；西文 OEM(437/850) 无 WHATWG 标签，近似用 windows-1252（显示名多为 ASCII，仅重音字符受影响）。
+let cpDecoder = null
+async function ansiDecoder () {
+  if (cpDecoder) return cpDecoder
+  const LABELS = {
+    936: 'gbk', 950: 'big5', 932: 'shift-jis', 949: 'euc-kr', 866: 'ibm866',
+    437: 'windows-1252', 850: 'windows-1252',
+    1250: 'windows-1250', 1251: 'windows-1251', 1252: 'windows-1252',
+    1253: 'windows-1253', 1254: 'windows-1254', 1255: 'windows-1255',
+    1256: 'windows-1256', 1257: 'windows-1257', 65001: 'utf-8'
+  }
+  let label = 'utf-8'
+  try {
+    const { stdout } = await run('chcp.com', [], 5000)
+    const m = /(\d{3,5})/.exec(String(stdout))
+    if (m) label = LABELS[Number(m[1])] || 'utf-8'
+  } catch (e) { /* 探测失败按 utf-8：服务名/状态行恒为 ASCII，仅显示名可能受损 */ }
+  try { cpDecoder = new TextDecoder(label) } catch (e) { cpDecoder = new TextDecoder() }
+  return cpDecoder
+}
+
 function parseJsonOut (stdout) {
   try {
     const v = JSON.parse(stdout)
@@ -134,19 +173,35 @@ ConvertTo-Json -InputObject @($out) -Compress
   return (Array.isArray(rows) ? rows : [rows]).map(normalizeSvc).filter(Boolean)
 }
 
-// 全量服务列表（添加页用；不读注册表，保证速度）
+// 全量服务列表（添加页用）：sc.exe + reg.exe，不依赖 PowerShell/WMI。
+// v1.0.3 上架被拒根因：审核环境 CIM 全量查询可慢至超时（界面表现为"点添加卡死"）。
+// sc query state= all 一次给出全部 Win32 服务的名称/显示名/状态（~100ms）；
+// 启动类型与延迟标志来自注册表两次 /s /v 遍历（各 ~0.4s），三者并行，总耗时 <1s。
+// sc 失败或零结果时抛错（让界面给出明确失败与重试）；注册表查询失败仅降级——
+// 启动类型标签回退为"手动"（真实服务键必有 Start 值，回退只发生在 reg.exe 被策略禁用时）。
 async function listAllServices () {
-  const script = `
-$ErrorActionPreference = 'SilentlyContinue'
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$out = Get-CimInstance Win32_Service | ForEach-Object {
-  [PSCustomObject]@{ exists=$true; name=$_.Name; displayName=$_.DisplayName; state=[string]$_.State; startMode=[string]$_.StartMode; acceptPause=($_.AcceptPause -eq $true) }
-}
-ConvertTo-Json -InputObject @($out) -Compress
-`
-  const { stdout } = await runPs(script, 30000)
-  const rows = parseJsonOut(stdout)
-  return (Array.isArray(rows) ? rows : [rows]).map(normalizeSvc).filter(x => x && x.exists)
+  const dec = await ansiDecoder()
+  const SVC_KEY = 'HKLM\\SYSTEM\\CurrentControlSet\\Services'
+  const [sc, regStart, regDelayed] = await Promise.all([
+    runBuf('sc.exe', ['query', 'state=', 'all']),
+    runBuf('reg.exe', ['query', SVC_KEY, '/s', '/v', 'Start']),
+    runBuf('reg.exe', ['query', SVC_KEY, '/s', '/v', 'DelayedAutostart'])
+  ])
+  if (sc.code !== 0) throw new Error('服务枚举失败：sc.exe 退出码 ' + sc.code)
+  const rows = P.parseScQueryAll(dec.decode(sc.buf))
+  if (!rows.length) throw new Error('服务枚举失败：sc.exe 未返回任何服务')
+  const startMap = P.parseRegDwordByName(dec.decode(regStart.buf), 'Start')
+  const delayedSet = new Set(Object.keys(P.parseRegDwordByName(dec.decode(regDelayed.buf), 'DelayedAutostart')))
+  // 注册表 Start：2=自动 3=手动 4=禁用（0/1 为引导期驱动，不会出现在 sc 的 Win32 枚举里）
+  const stWord = { 2: 'auto', 3: 'demand', 4: 'disabled' }
+  return rows.map(r => ({
+    exists: true,
+    name: r.name,
+    displayName: r.displayName || r.name,
+    state: r.state,
+    startType: (startMap[r.name] === 2 && delayedSet.has(r.name)) ? 'delayed-auto' : (stWord[startMap[r.name]] || 'demand'),
+    acceptPause: !!r.acceptPause
+  }))
 }
 
 /* ---------------- 状态轮询（sc.exe 轻量热路径） ---------------- */
@@ -506,14 +561,14 @@ function storageDump () {
   return out
 }
 
-appendLog('preload 加载 build=preload-2026-09-29-a via=' + utoolsVia() +
+appendLog('preload 加载 build=preload-2026-10-13-a via=' + utoolsVia() +
   ' hasDbStorage=' + !!(utoolsApi() && utoolsApi().dbStorage) +
   ' hasDb=' + !!(utoolsApi() && utoolsApi().db))
 registerMcpToolsWithRetry(0)
 
 /* ---------------- 向渲染进程暴露接口 ---------------- */
 window.svcApi = {
-  BUILD: 'preload-2026-09-29-a',
+  BUILD: 'preload-2026-10-13-a',
   debugLog: (line) => appendLog('[ui] ' + line),
   storageRead: (key) => dbGet(key, null),
   storageWrite: (key, val) => dbSet(key, val),

@@ -181,7 +181,8 @@ async function addSvc (row) {
   if (svc.debugLog) svc.debugLog('addSvc ' + row.name + ' result=' + JSON.stringify(r) + ' env=' + JSON.stringify(env) + ' whitelist=' + JSON.stringify(whitelist.value))
   if (r.ok) toast(`已添加 ${row.name}`, 'ok')
   else toast(`保存失败：${r.errors.join('；')}`, 'error')
-  // 新卡片先补一次全量信息（含启动类型），轮询热路径只更新状态
+  // 添加页快路径（sc+reg）已带回状态/启动类型，先上屏；下面的 PS 冷查询只补描述/账户等扩展信息
+  live[row.name] = Object.assign({}, row, live[row.name])
   svc.getStatuses([row.name]).then(rows => {
     if (rows[0]) live[rows[0].name] = Object.assign({}, live[rows[0].name], rows[0])
   }).catch(() => {})
