@@ -84,7 +84,7 @@ function demoBackend () {
       return Object.fromEntries(db.get('granted', ['Redis']).map(n => [n, 'DEMO']))
     },
     async getWhitelist () { return db.get('wl', [{ name: 'Redis', displayName: 'Redis' }, { name: 'Consul', displayName: 'Consul' }, { name: 'nginx', displayName: 'nginx' }]) },
-    async saveWhitelist (list) { db.set('wl', list) },
+    async saveWhitelist (list) { db.set('wl', list); return true },
     async getSettings () { return Object.assign({ mcpEnabled: false, mcpWriteEnabled: false }, db.get('settings', {})) },
     async saveSettings (patch) {
       const next = Object.assign(await this.getSettings(), patch || {})
@@ -92,7 +92,9 @@ function demoBackend () {
       return next
     },
     async getAudit () { return db.get('audit', []) },
-    async clearAudit () { db.set('audit', []) }
+    async clearAudit () { db.set('audit', []) },
+    cancelElevated () { /* demo 无 UAC 流程 */ },
+    async storageSelfTest () { return { ok: true, via: 'demo', backends: { demo: 'ok' } } }
   }
 }
 
@@ -115,7 +117,9 @@ function wrapReal (api) {
     getSettings: () => api.getSettings(),
     saveSettings: (patch) => api.saveSettings(patch),
     getAudit: () => api.getAudit(),
-    clearAudit: () => api.clearAudit()
+    clearAudit: () => api.clearAudit(),
+    cancelElevated: () => api.cancelElevatedAuth(),
+    storageSelfTest: () => api.storageSelfTest()
   }
 }
 

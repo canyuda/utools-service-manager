@@ -5,6 +5,7 @@
 // 向渲染进程暴露 window.svcApi；插件初始化时通过 utools.registerTool 注册 MCP 工具。
 const { execFile } = require('child_process')
 const fs = require('fs')
+const fsp = fs.promises
 const os = require('os')
 const path = require('path')
 const P = require('./svc-parse.js')
@@ -32,10 +33,11 @@ function utoolsVia () {
 /* ---------------- 进程执行 ---------------- */
 const RUN_TIMEOUT = 15000
 const PS_TIMEOUT = 20000
+const ELEVATED_TIMEOUT = 60000
 
-function run (cmd, args, timeout = RUN_TIMEOUT) {
+function run (cmd, args, timeout = RUN_TIMEOUT, onSpawn) {
   return new Promise((resolve) => {
-    execFile(cmd, args, {
+    const child = execFile(cmd, args, {
       encoding: 'utf8',
       timeout,
       windowsHide: true,
@@ -46,11 +48,12 @@ function run (cmd, args, timeout = RUN_TIMEOUT) {
       }
       resolve({ code: err ? err.code : 0, stdout: stdout || '', stderr: stderr || '' })
     })
+    if (onSpawn) onSpawn(child) // 供等待 UAC 期间从外部 kill
   })
 }
 
-function runPs (script, timeout = PS_TIMEOUT) {
-  return run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], timeout)
+function runPs (script, timeout = PS_TIMEOUT, onSpawn) {
+  return run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script], timeout, onSpawn)
 }
 
 // 以 Buffer 取原始输出（控制台程序管道输出是系统码页字节，utf8 解码会毁掉中文显示名）
@@ -92,15 +95,6 @@ async function ansiDecoder () {
   return cpDecoder
 }
 
-function parseJsonOut (stdout) {
-  try {
-    const v = JSON.parse(stdout)
-    return v
-  } catch (e) {
-    return []
-  }
-}
-
 /* ---------------- 错误码映射（设计文档 §7.2） ---------------- */
 const ERR_TEXT = {
   0: '成功',
@@ -119,58 +113,48 @@ function textOfCode (code, fallback) {
 const START_TYPE_TEXT = { auto: '自动', 'delayed-auto': '自动(延迟启动)', demand: '手动', disabled: '禁用' }
 const START_TYPES = ['auto', 'delayed-auto', 'demand', 'disabled']
 
-/* ---------------- 服务查询（PowerShell 单进程批量） ---------------- */
-function psNameLit (n) { return String(n).replace(/'/g, "''") }
+const SVC_ROOT_KEY = 'HKLM\\SYSTEM\\CurrentControlSet\\Services'
 
-// startMode(Auto/Manual/Disabled) + 注册表 DelayedAutostart → auto/delayed-auto/demand/disabled
-function mapStartType (startMode, delayed) {
-  if (startMode === 'Auto') return delayed ? 'delayed-auto' : 'auto'
-  if (startMode === 'Disabled') return 'disabled'
-  return 'demand'
+// 注册表值名不区分大小写（实机见过 DelayedAutoStart/DelayedAutostart 两种拼法）
+function regVal (vals, name) {
+  const want = name.toLowerCase()
+  for (const k of Object.keys(vals)) if (k.toLowerCase() === want) return vals[k]
+  return undefined
 }
 
-function normalizeSvc (s) {
-  if (!s) return null
-  if (s.exists === false) return { exists: false, name: s.name }
+/* ---------------- 服务完整信息（冷路径：sc query + sc qc + reg 单键，零 WMI） ---------------- */
+// v1.0.5 整改：v1.0.2~v1.0.4 三次"卡死"拒绝的共同根源是 PowerShell/WMI 冷查询（PS 冷启动
+// 秒级起步，审核模板机 WMI 全量查询可慢至超时）。完整信息改用三个纯控制台命令并行（各几十 ms）：
+//   sc query <name> → 状态/显示名/可暂停位；sc qc <name> → 启动类型/二进制路径/运行账户；
+//   reg query <服务键>（单键全值）→ DelayedAutostart/Description（延迟启动标志仅存于注册表）。
+async function getServiceInfo (name, dec) {
+  const [q, qc, reg] = await Promise.all([
+    runBuf('sc.exe', ['query', name]),
+    runBuf('sc.exe', ['qc', name]),
+    runBuf('reg.exe', ['query', SVC_ROOT_KEY + '\\' + name])
+  ])
+  const st = P.parseScQueryOne(dec.decode(q.buf))
+  if (!st) return { exists: false, name }
+  const cfg = P.parseScQc(dec.decode(qc.buf))
+  const vals = P.parseRegValuesByName(dec.decode(reg.buf))
+  const delayed = /^0x0*1$/i.test(String(regVal(vals, 'DelayedAutostart') || ''))
+  const startType = cfg.startTypeNum === 2 ? (delayed ? 'delayed-auto' : 'auto')
+    : cfg.startTypeNum === 4 ? 'disabled' : 'demand'
   return {
     exists: true,
-    name: s.name,
-    displayName: s.displayName,
-    state: s.state,
-    startType: mapStartType(s.startMode, !!s.delayed),
-    acceptPause: !!s.acceptPause,
-    acceptStop: !!s.acceptStop,
-    account: s.account,
-    binPath: s.binPath,
-    description: s.description,
-    processId: s.processId
+    name,
+    displayName: st.displayName || cfg.displayName || name,
+    state: st.state,
+    startType,
+    acceptPause: st.acceptPause,
+    account: cfg.account,
+    binPath: cfg.binPath,
+    description: String(regVal(vals, 'Description') || '')
   }
 }
-
-// 按服务名批量查询（含延迟启动标志），单次 PowerShell 进程完成
 async function getServicesStatus (names) {
-  const lit = JSON.stringify((names || []).map(String)).replace(/'/g, "''")
-  const script = `
-$ErrorActionPreference = 'SilentlyContinue'
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$names = @('${lit}') | ConvertFrom-Json
-$out = foreach ($n in $names) {
-  $nn = [string]$n -replace "'", "''"
-  $s = Get-CimInstance Win32_Service -Filter "Name='$nn'" | Select-Object -First 1
-  if ($s) {
-    $delayed = $false
-    $rp = Get-ItemProperty -Path ("HKLM:\\SYSTEM\\CurrentControlSet\\Services\\" + $s.Name) -ErrorAction SilentlyContinue
-    if ($rp -and $rp.DelayedAutostart -eq 1) { $delayed = $true }
-    [PSCustomObject]@{ exists=$true; name=$s.Name; displayName=$s.DisplayName; state=[string]$s.State; startMode=[string]$s.StartMode; delayed=$delayed; acceptPause=($s.AcceptPause -eq $true); acceptStop=($s.AcceptStop -eq $true); account=$s.StartName; binPath=$s.PathName; description=$s.Description; processId=$s.ProcessId }
-  } else {
-    [PSCustomObject]@{ exists=$false; name=[string]$n }
-  }
-}
-ConvertTo-Json -InputObject @($out) -Compress
-`
-  const { stdout } = await runPs(script)
-  const rows = parseJsonOut(stdout)
-  return (Array.isArray(rows) ? rows : [rows]).map(normalizeSvc).filter(Boolean)
+  const dec = await ansiDecoder()
+  return Promise.all(((names || []).map(String)).filter(Boolean).map(n => getServiceInfo(n, dec)))
 }
 
 // 全量服务列表（添加页用）：sc.exe + reg.exe，不依赖 PowerShell/WMI。
@@ -181,11 +165,10 @@ ConvertTo-Json -InputObject @($out) -Compress
 // 启动类型标签回退为"手动"（真实服务键必有 Start 值，回退只发生在 reg.exe 被策略禁用时）。
 async function listAllServices () {
   const dec = await ansiDecoder()
-  const SVC_KEY = 'HKLM\\SYSTEM\\CurrentControlSet\\Services'
   const [sc, regStart, regDelayed] = await Promise.all([
     runBuf('sc.exe', ['query', 'state=', 'all']),
-    runBuf('reg.exe', ['query', SVC_KEY, '/s', '/v', 'Start']),
-    runBuf('reg.exe', ['query', SVC_KEY, '/s', '/v', 'DelayedAutostart'])
+    runBuf('reg.exe', ['query', SVC_ROOT_KEY, '/s', '/v', 'Start']),
+    runBuf('reg.exe', ['query', SVC_ROOT_KEY, '/s', '/v', 'DelayedAutostart'])
   ])
   if (sc.code !== 0) throw new Error('服务枚举失败：sc.exe 退出码 ' + sc.code)
   const rows = P.parseScQueryAll(dec.decode(sc.buf))
@@ -205,8 +188,8 @@ async function listAllServices () {
 }
 
 /* ---------------- 状态轮询（sc.exe 轻量热路径） ---------------- */
-// 2 秒热路径不用 PowerShell：一次 `sc query state= all` 覆盖全量服务状态（单进程、开销约几十 ms），
-// 按白名单过滤返回；启动类型/显示名等完整信息仍走 getServicesStatus（用户触发的冷路径）。
+// 进入插件/聚焦时不用 PowerShell：一次 `sc query state= all` 覆盖全量服务状态（单进程、
+// 开销约几十 ms），按白名单过滤返回；描述/账户等完整信息按需走 getServicesStatus（展开详情时）。
 async function pollStatuses (names) {
   const want = new Set((names || []).map(String))
   if (!want.size) return []
@@ -214,7 +197,7 @@ async function pollStatuses (names) {
   return P.parseScQueryAll(stdout).filter(r => want.has(r.name))
 }
 
-// 单服务轻量状态查询（重启等待循环 / MCP 返回状态用，替代原来每 800ms 拉一次 PowerShell）
+// 单服务轻量状态查询（重启等待循环 / MCP 返回状态用）
 async function quickState (name) {
   const { stdout } = await run('sc.exe', ['query', name])
   return P.parseScQueryOne(stdout)
@@ -256,8 +239,12 @@ async function restartService (name) {
   return control(name, 'start')
 }
 
+// 管理员身份进程生命周期内不会变化，缓存避免每个进入周期跑两次 net session（冷机最长 8s）
+let adminCache = null
 async function isAdmin () {
-  return (await run('net', ['session'], 8000)).code === 0
+  if (adminCache != null) return adminCache
+  adminCache = (await run('net', ['session'], 8000)).code === 0
+  return adminCache
 }
 
 /* ---------------- 按服务授权（SDDL 追加当前用户 ACE，UAC 提权执行） ---------------- */
@@ -302,6 +289,13 @@ function tempPath (ext) {
 
 // 写任务文件 → UAC 拉起提权 PS 执行 AUTH_PS1 → 读回结果文件。
 // exit 1252 = UAC 被取消/提权失败；结果文件缺失同义。
+// 等待上限 60s 且可被 cancelElevatedAuth 中止（v1.0.5：120s 不可取消曾被审核判"卡死"）。
+let elevatedJob = null
+function cancelElevatedAuth () {
+  if (!elevatedJob) return
+  elevatedJob.cancelled = true
+  try { elevatedJob.child.kill() } catch (e) { /* ignore */ }
+}
 async function runElevatedAuth (job) {
   const jobPath = tempPath('job.json')
   const resultPath = tempPath('result.json')
@@ -312,9 +306,19 @@ async function runElevatedAuth (job) {
   const q = (s) => String(s).replace(/'/g, "''")
   const launcher = "$ErrorActionPreference='Stop'; try { $p = Start-Process powershell.exe -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','" + q(scriptPath) + "','-JobPath','" + q(jobPath) + "','-ResultPath','" + q(resultPath) + "'; exit $p.ExitCode } catch { exit 1252 }"
   try {
-    const { code } = await runPs(launcher, 120000)
+    const { code } = await runPs(launcher, ELEVATED_TIMEOUT, (child) => { elevatedJob = { child, cancelled: false } })
+    const cancelled = !!(elevatedJob && elevatedJob.cancelled)
     let res = null
     try { res = JSON.parse(fs.readFileSync(resultPath, 'utf8').replace(/^\uFEFF/, '')) } catch (e) { /* 无结果文件 = UAC 未确认或脚本未执行 */ }
+    if (!res && cancelled) {
+      // kill 只打到外层 launcher；若提权脚本已确认并在执行，等它最多 2s 写完结果，
+      // 避免"ACE 已写入但备份未入账"（真丢了备份时重新授权一次即可补录：已含 ACE 会返回原串）
+      for (let i = 0; i < 10 && !res; i++) {
+        await new Promise(r => setTimeout(r, 200))
+        try { res = JSON.parse(fs.readFileSync(resultPath, 'utf8').replace(/^\uFEFF/, '')) } catch (e) { /* 未生成 */ }
+      }
+      if (res) return res
+    }
     if (!res) {
       return code === 1252
         ? { ok: false, cancelled: true, message: '已取消：未在 UAC 窗口中确认授权' }
@@ -322,6 +326,7 @@ async function runElevatedAuth (job) {
     }
     return res
   } finally {
+    elevatedJob = null
     for (const f of [jobPath, resultPath, scriptPath]) { try { fs.unlinkSync(f) } catch (e) { /* ignore */ } }
   }
 }
@@ -332,12 +337,12 @@ async function grantAuth (names) {
   const sid = await getUserSid()
   if (!sid) return { ok: false, message: '无法获取当前用户 SID，无法授权' }
   const res = await runElevatedAuth({ services: list, sid })
-  const backups = dbGet(K.auth, {})
+  const backups = await dbGet(K.auth, {})
   let changed = false
   for (const x of ((res && res.results) || [])) {
     if (x.ok && x.before) { backups[x.name] = x.before; changed = true }
   }
-  if (changed) dbSet(K.auth, backups)
+  if (changed) await dbSet(K.auth, backups)
   return res
 }
 
@@ -351,7 +356,7 @@ function revokeAuth (names) {
 }
 async function doRevokeAuth (names) {
   const list = [...new Set((names || []).map(String))].filter(Boolean)
-  const backups = dbGet(K.auth, {})
+  const backups = await dbGet(K.auth, {})
   const have = {}
   const missing = []
   for (const n of list) {
@@ -366,7 +371,7 @@ async function doRevokeAuth (names) {
     results.push(...((r && r.results) || []))
     if (r && r.ok) {
       for (const n of Object.keys(have)) delete backups[n]
-      dbSet(K.auth, backups)
+      await dbSet(K.auth, backups)
     } else {
       return { ok: false, results }
     }
@@ -374,91 +379,111 @@ async function doRevokeAuth (names) {
   return { ok: missing.length === 0, results }
 }
 
-function getAuthBackups () { return dbGet(K.auth, {}) }
+async function getAuthBackups () { return dbGet(K.auth, {}) }
 
-/* ---------------- 持久化（utools.dbStorage） ---------------- */
-const K = { wl: 'svc_whitelist', settings: 'svc_settings', audit: 'svc_audit', auth: 'svc_auth_backup' }
+/* ---------------- 持久化：utools.db 单后端异步读写 ---------------- */
+// v1.0.5 整改：旧版 dbStorage+db 双后端全写+写后读回验证，每次进入插件 ~30 个同步 IPC
+// 调用全部阻塞渲染进程（同步 db/dbStorage 是官方文档明确的同步 API），是"连带 uTools
+// 一起卡死"的主要根源。改为 utools.db.promises 异步单写（_rev 冲突重试一次），失败回传
+// false 由界面 toast；db 未命中时回退读一次旧版写入的 dbStorage 键（双写时代的迁移兼容）。
+const K = { wl: 'svc_whitelist', settings: 'svc_settings', auth: 'svc_auth_backup' }
 const DEFAULT_SETTINGS = { mcpEnabled: false, mcpWriteEnabled: false }
 
-/* ---- 持久化双后端（与渲染进程 store.js 同策略）：dbStorage + utools.db 文档库 ---- */
-function bStorageApi (u) {
-  if (!u || !u.dbStorage) return null
-  return {
-    read (k) { const v = u.dbStorage.getItem(k); return v == null ? null : v },
-    write (k, v) {
-      u.dbStorage.setItem(k, v)
-      const back = u.dbStorage.getItem(k)
-      if (JSON.stringify(back) !== JSON.stringify(v)) throw new Error('写后读不一致')
-    }
+async function dbGet (key, def) {
+  const u = utoolsApi()
+  if (u && u.db && u.db.promises) {
+    try {
+      const d = await u.db.promises.get(key)
+      if (d && d.data != null) return d.data
+    } catch (e) { console.error('[svc] db.get 失败：' + key, e) }
   }
-}
-function bDocApi (u) {
-  if (!u || !u.db) return null
-  return {
-    read (k) { const d = u.db.get(k); return d ? (d.data == null ? null : d.data) : null },
-    write (k, v) {
-      const doc = u.db.get(k)
-      let r = doc ? u.db.put(Object.assign({}, doc, { data: v })) : u.db.put({ _id: k, data: v })
-      if (!r.ok && /rev|conflict/i.test(String((r && r.error) || ''))) {
-        const cur = u.db.get(k)
-        if (cur) r = u.db.put(Object.assign({}, cur, { data: v }))
-      }
-      if (!r || !r.ok) throw new Error('db.put 失败: ' + ((r && r.error) || '未知'))
-    }
-  }
-}
-function dbBackends () { const u = utoolsApi(); return [bStorageApi(u), bDocApi(u)].filter(Boolean) }
-
-function dbGet (key, def) {
-  for (const b of dbBackends()) {
-    try { const v = b.read(key); if (v != null) return v } catch (e) { console.error('[svc] read(' + b.name + ') 失败：' + key, e) }
+  if (u && u.dbStorage) {
+    try { const v = u.dbStorage.getItem(key); if (v != null) return v } catch (e) { /* ignore */ }
   }
   return def
 }
-function dbSet (key, val) {
-  let okAny = false
-  const errs = []
-  for (const b of dbBackends()) {
-    try { b.write(key, val); okAny = true } catch (e) {
-      errs.push(b.name + ': ' + e.message)
-      console.error('[svc] write(' + b.name + ') 失败：' + key, e)
-    }
+
+async function dbSet (key, val) {
+  const u = utoolsApi()
+  if (!u || !u.db || !u.db.promises) {
+    console.error('[svc] 写入失败（utools.db 不可用）：' + key)
+    return false
   }
-  if (!okAny) console.error('[svc] 所有后端写入失败：' + key + ' | ' + errs.join(' | '))
-  return okAny
+  try {
+    const cur = await u.db.promises.get(key)
+    let r = await u.db.promises.put(cur ? Object.assign({}, cur, { data: val }) : { _id: key, data: val })
+    if ((!r || !r.ok) && /rev|conflict/i.test(String((r && r.error) || ''))) {
+      const again = await u.db.promises.get(key)
+      if (again) r = await u.db.promises.put(Object.assign({}, again, { data: val }))
+    }
+    if (!r || !r.ok) {
+      console.error('[svc] db.put 失败：' + key + ' ' + ((r && r.error) || '未知'))
+      return false
+    }
+    return true
+  } catch (e) {
+    console.error('[svc] db.put 异常：' + key, e)
+    return false
+  }
 }
 
-function getWhitelist () {
-  const v = dbGet(K.wl, {})
+async function getWhitelist () {
+  const v = await dbGet(K.wl, {})
   const out = Array.isArray(v) ? v : (v && Array.isArray(v.list) ? v.list : [])
-  appendLog('getWhitelist raw=' + JSON.stringify(v) + ' -> ' + out.length + ' 项')
   return out
 }
-function saveWhitelist (list) {
-  const wrapped = { list: Array.isArray(list) ? list : [] }
-  const ok = dbSet(K.wl, wrapped)
-  appendLog('saveWhitelist ok=' + ok + ' ' + JSON.stringify(wrapped))
-  return ok
+async function saveWhitelist (list) {
+  // 白名单必须包对象存储：uTools 的 db 不接受顶层数组（会被静默拒绝）
+  return dbSet(K.wl, { list: Array.isArray(list) ? list : [] })
 }
 
-function getSettings () { return Object.assign({}, DEFAULT_SETTINGS, dbGet(K.settings, {})) }
-function saveSettings (patch) {
-  const next = Object.assign(getSettings(), patch || {})
-  dbSet(K.settings, next)
+async function getSettings () { return Object.assign({}, DEFAULT_SETTINGS, await dbGet(K.settings, {})) }
+async function saveSettings (patch) {
+  const next = Object.assign(await getSettings(), patch || {})
+  await dbSet(K.settings, next)
   return next
 }
 
-function getAudit () { return dbGet(K.audit, []) }
-function pushAudit (tool, input, result) {
-  const list = getAudit()
-  list.unshift({ ts: Date.now(), tool, input: input || {}, ok: !!(result && result.ok), message: (result && result.message) || '' })
-  dbSet(K.audit, list.slice(0, 50))
+/* ---------------- 审计日志：插件本地数据目录文件（操作记录不入同步库） ---------------- */
+// 官方存储规范：操作记录类数据应存 getPluginLocalDataPath() 本地目录，不占同步数据库；
+// 旧版把审计写进 db/dbStorage，MCP 每次调用一串同步写也加剧卡顿。
+let auditCache = null // 读一次后驻留内存，写时同步更新
+let auditPathCache
+function auditPath () {
+  if (auditPathCache !== undefined) return auditPathCache
+  try {
+    const u = utoolsApi()
+    auditPathCache = (u && u.getPluginLocalDataPath) ? path.join(u.getPluginLocalDataPath(), 'audit.json') : null
+  } catch (e) { auditPathCache = null }
+  return auditPathCache
 }
-function clearAudit () { dbSet(K.audit, []) }
+async function readAudit () {
+  if (auditCache) return auditCache
+  const p = auditPath()
+  if (!p) return []
+  try {
+    const v = JSON.parse(await fsp.readFile(p, 'utf8'))
+    auditCache = Array.isArray(v) ? v : []
+  } catch (e) { auditCache = [] }
+  return auditCache
+}
+async function writeAudit (list) {
+  auditCache = list
+  const p = auditPath()
+  if (!p) return
+  try { await fsp.writeFile(p, JSON.stringify(list), 'utf8') } catch (e) { console.error('[svc] 审计文件写入失败', e) }
+}
+async function pushAudit (tool, input, result) {
+  const list = await readAudit()
+  list.unshift({ ts: Date.now(), tool, input: JSON.parse(JSON.stringify(input || {})), ok: !!(result && result.ok), message: (result && result.message) || '' })
+  await writeAudit(list.slice(0, 50))
+}
+async function getAudit () { return (await readAudit()).slice() }
+async function clearAudit () { await writeAudit([]) }
 
 /* ---------------- MCP 工具（plugin.json tools 键必须一一对应） ---------------- */
-function guard (write) {
-  const st = getSettings()
+async function guard (write) {
+  const st = await getSettings()
   if (!st.mcpEnabled) return { ok: false, errorCode: 'MCP_DISABLED', message: 'Agent 控制未开启：请在 uTools 插件「Windows 服务管理」设置中开启 MCP 总开关' }
   if (write && !st.mcpWriteEnabled) return { ok: false, errorCode: 'MCP_WRITE_DISABLED', message: 'Agent 写操作未开启：请在插件设置中允许 Agent 写操作' }
   return null
@@ -480,18 +505,18 @@ function registerMcpTools () {
     u.registerTool(tool, async (params) => {
       let result
       try {
-        const g = guard(write)
+        const g = await guard(write)
         result = g || await fn(params || {})
       } catch (e) {
         result = { ok: false, errorCode: 'ERROR', message: String((e && e.message) || e) }
       }
-      pushAudit(tool, params, result)
+      await pushAudit(tool, params, result)
       return result
     })
   }
 
   wrap('list_managed_services', false, async () => {
-    const wl = getWhitelist()
+    const wl = await getWhitelist()
     const services = await getServicesStatus(wl.map(x => x.name))
     return { ok: true, count: services.length, services }
   })
@@ -524,7 +549,7 @@ function registerMcpTools () {
   })
 
   wrap('storage_debug', false, async () => {
-    return { ok: true, dump: storageDump() }
+    return { ok: true, dump: await storageDump() }
   })
 }
 function psName (p) { return String((p && p.name) || '') }
@@ -541,37 +566,68 @@ function registerMcpToolsWithRetry (attempt) {
     appendLog('registerTool 最终失败：桥始终未注入')
   }
 }
-// 诊断：preload 环境下两个后端中所有键的原始内容
-function storageDump () {
+
+// 诊断：db 中各键原始内容 + 审计文件内容
+async function storageDump () {
   const u = utoolsApi()
   const out = {
     via: u ? (typeof window !== 'undefined' && window.utools ? 'window.utools' : 'global utools') : '未注入',
-    hasDbStorage: !!(u && u.dbStorage),
     hasDb: !!(u && u.db),
-    kv: {},
-    docs: {}
+    db: {},
+    auditFile: null
   }
-  const keys = Object.values(K)
-  if (u && u.dbStorage) {
-    for (const k of keys) { try { out.kv[k] = u.dbStorage.getItem(k) } catch (e) { out.kv[k] = 'ERR: ' + e.message } }
+  if (u && u.db && u.db.promises) {
+    for (const k of Object.values(K)) {
+      try { const d = await u.db.promises.get(k); out.db[k] = d ? d.data : null } catch (e) { out.db[k] = 'ERR: ' + e.message }
+    }
   }
-  if (u && u.db) {
-    for (const k of keys) { try { const d = u.db.get(k); out.docs[k] = d ? d.data : null } catch (e) { out.docs[k] = 'ERR: ' + e.message } }
-  }
+  try { out.auditFile = JSON.parse(await fsp.readFile(auditPath(), 'utf8')) } catch (e) { out.auditFile = null }
   return out
 }
 
-appendLog('preload 加载 build=preload-2026-10-13-a via=' + utoolsVia() +
-  ' hasDbStorage=' + !!(utoolsApi() && utoolsApi().dbStorage) +
+// 存储自检（手动触发，设置页入口）：db 异步写读删 + 审计文件落盘校验（绕过内存缓存直写磁盘）
+async function storageSelfTest () {
+  const u = utoolsApi()
+  const out = { ok: false, via: '', backends: {} }
+  if (!u || !u.db || !u.db.promises) {
+    out.via = '未注入'
+    out.backends['-'] = 'utools.db 不可用'
+    return out
+  }
+  out.via = 'utools.db(异步)'
+  const id = '__svc_selftest__'
+  try {
+    const cur = await u.db.promises.get(id)
+    const r = await u.db.promises.put(cur ? Object.assign({}, cur, { data: 1 }) : { _id: id, data: 1 })
+    if (!r || !r.ok) throw new Error('db.put 失败: ' + ((r && r.error) || '未知'))
+    const back = await u.db.promises.get(id)
+    const rm = await u.db.promises.remove(id)
+    out.backends.db = (back && back.data === 1 && rm && rm.ok) ? 'ok' : '读回不一致'
+  } catch (e) { out.backends.db = '失败: ' + e.message }
+  try {
+    const p = auditPath()
+    if (!p) throw new Error('本地数据目录不可用')
+    const orig = await fsp.readFile(p, 'utf8').catch(() => null)
+    await fsp.writeFile(p, '[{"ts":1,"tool":"__selftest__","ok":true}]', 'utf8')
+    const back = JSON.parse(await fsp.readFile(p, 'utf8'))
+    if (orig == null) await fsp.unlink(p).catch(() => {})
+    else await fsp.writeFile(p, orig, 'utf8')
+    auditCache = null
+    out.backends.audit = (back[0] && back[0].tool === '__selftest__') ? 'ok' : '读回不一致'
+  } catch (e) { out.backends.audit = '失败: ' + e.message }
+  out.ok = out.backends.db === 'ok'
+  return out
+}
+
+appendLog('preload 加载 build=preload-2026-10-15-a via=' + utoolsVia() +
   ' hasDb=' + !!(utoolsApi() && utoolsApi().db))
 registerMcpToolsWithRetry(0)
+isAdmin().catch(() => {}) // 预热管理员检测缓存：uTools 拉起插件（含 MCP 后台拉起）时即完成一次 net session
 
 /* ---------------- 向渲染进程暴露接口 ---------------- */
 window.svcApi = {
-  BUILD: 'preload-2026-10-13-a',
+  BUILD: 'preload-2026-10-15-a',
   debugLog: (line) => appendLog('[ui] ' + line),
-  storageRead: (key) => dbGet(key, null),
-  storageWrite: (key, val) => dbSet(key, val),
   getServicesStatus,
   pollStatuses,
   listAllServices,
@@ -582,6 +638,7 @@ window.svcApi = {
   checkAuth,
   grantAuth,
   revokeAuth,
+  cancelElevatedAuth,
   getAuthBackups,
   getWhitelist,
   saveWhitelist,
@@ -590,6 +647,7 @@ window.svcApi = {
   getAudit,
   clearAudit,
   storageDump,
+  storageSelfTest,
   START_TYPE_TEXT,
   START_TYPES,
   ERR_TEXT

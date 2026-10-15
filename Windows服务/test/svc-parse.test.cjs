@@ -70,6 +70,59 @@ const one = P.parseScQueryOne('SERVICE_NAME: nginx \n        STATE              
 assert.deepStrictEqual(one, { name: 'nginx', state: 'Paused', acceptPause: true })
 assert.strictEqual(P.parseScQueryOne('[SC] OpenService 失败 1060'), null)
 
+/* ---- parseScQc：sc qc 输出 → 启动类型数字 / 二进制 / 账户 / 显示名 ---- */
+const qc = P.parseScQc([
+  '',
+  'SERVICE_NAME: Redis',
+  '        TYPE               : 10  WIN32_OWN_PROCESS',
+  '        START_TYPE         : 2   AUTO_START',
+  '        ERROR_CONTROL      : 1   NORMAL',
+  '        BINARY_PATH_NAME   : "C:\\Program Files\\Redis\\redis-server.exe" --service-run',
+  '        LOAD_ORDER_GROUP   : ',
+  '        TAG                : 0',
+  '        DISPLAY_NAME       : Redis',
+  '        DEPENDENCIES       : ',
+  '        SERVICE_START_NAME : LocalSystem',
+  ''
+].join('\r\n'))
+assert.deepStrictEqual(qc, {
+  startTypeNum: 2,
+  binPath: 'C:\\Program Files\\Redis\\redis-server.exe --service-run', // 剥掉路径包裹引号、保留参数
+  account: 'LocalSystem',
+  displayName: 'Redis'
+}, '应解析 qc 各字段（含引号剥离）')
+assert.strictEqual(P.parseScQc('SERVICE_NAME: X\n        START_TYPE         : 4   DISABLED').startTypeNum, 4)
+assert.strictEqual(P.parseScQc('SERVICE_NAME: X\n        START_TYPE         : 3   DEMAND_START').startTypeNum, 3)
+assert.deepStrictEqual(P.parseScQc(''), { startTypeNum: 0, binPath: '', account: '', displayName: '' })
+assert.deepStrictEqual(P.parseScQc(null), { startTypeNum: 0, binPath: '', account: '', displayName: '' })
+assert.strictEqual(P.parseScQc('[SC] OpenService 失败 1060').startTypeNum, 0, '失败输出不应误解析出启动类型')
+
+/* ---- parseRegValuesByName：reg query 单键全值 → { 值名: 原始值串 } ---- */
+const regVals = P.parseRegValuesByName([
+  '',
+  'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Redis',
+  '    Type    REG_DWORD    0x10',
+  '    Start    REG_DWORD    0x2',
+  '    ErrorControl    REG_DWORD    0x1',
+  '    ImagePath    REG_EXPAND_SZ    "C:\\Redis\\redis-server.exe" --service-run',
+  '    DisplayName    REG_SZ    Redis \u670D\u52A1',
+  '    ObjectName    REG_SZ    LocalSystem',
+  '    DelayedAutostart    REG_DWORD    0x1',
+  '    Description    REG_SZ    @C:\\Redis\\redis.dll,-300',
+  '',
+  'HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Redis\\Parameters',
+  '    Foo    REG_SZ    bar', // 子键头之下的值应并入同一 map（调用方只取关心的键名）
+  '',
+  '\u641C\u7D22\u7ED3\u675F: \u627E\u5230 1 \u5339\u914D\u3002'
+].join('\r\n'))
+assert.strictEqual(regVals.DelayedAutostart, '0x1')
+assert.strictEqual(regVals.Start, '0x2')
+assert.strictEqual(regVals.Description, '@C:\\Redis\\redis.dll,-300')
+assert.strictEqual(regVals.DisplayName, 'Redis \u670D\u52A1')
+assert.deepStrictEqual(P.parseRegValuesByName(''), {})
+assert.deepStrictEqual(P.parseRegValuesByName(null), {})
+assert.deepStrictEqual(P.parseRegValuesByName('HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\NoValKey'), {}, '无值行应返回空')
+
 /* ---- extractSddl：sdshow 输出 → SDDL 行 ---- */
 const SDD_SHOW = '\nD:(A;;CCLCSWLOCRRC;;;AU)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPWPDTLOCRRC;;;SY)\n'
 const sddl = P.extractSddl(SDD_SHOW)

@@ -46,6 +46,11 @@ body {
 }
 :root[data-theme="dark"] .banner { color: #e8b45a; }
 .banner a { color: var(--blue); text-decoration: none; cursor: pointer; white-space: nowrap; }
+/* UAC 等待横幅：悬浮显示，盖过设置弹层（z-index 50，撤销授权从弹层发起），不挡 toast（99） */
+.banner.elevating {
+  position: fixed; left: 0; right: 0; top: 0; z-index: 90;
+  box-shadow: var(--shadow);
+}
 .demo-chip {
   font-size: 11px; padding: 2px 8px; border-radius: 10px;
   background: var(--blue-bg); color: var(--blue); border: 1px solid var(--blue);

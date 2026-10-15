@@ -5,7 +5,7 @@ import AddServiceView from './components/AddServiceView.vue'
 import SettingsModal from './components/SettingsModal.vue'
 import { svc, isDemo } from './lib/backend.js'
 import * as store from './lib/store.js'
-import { storageSelfTest, BUILD as UI_BUILD } from './lib/store.js'
+import { BUILD as UI_BUILD } from './lib/store.js'
 
 /* ---------- 视图与状态 ---------- */
 const view = ref('main')            // main | add
@@ -20,7 +20,7 @@ const authMap = reactive({})        // name -> 是否已授权（undefined = 尚
 const granting = ref(false)
 const authNames = ref([])           // 已授权（有备份原串）的服务名列表
 const settings = ref({ mcpEnabled: false, mcpWriteEnabled: false })
-const storageDiag = ref(null)
+const storageDiag = ref(null)       // 存储自检结果（v1.0.5 起改为设置页手动触发，不再每次进入都跑）
 const preloadBuild = ref('')
 const statusLoaded = ref(false)   // 首次状态查询完成前，卡片显示"获取状态中"而非"查询失败"
 const settingsOpen = ref(false)
@@ -51,31 +51,16 @@ async function init () {
   try {
     preloadBuild.value = (window.svcApi && window.svcApi.BUILD) || '未检测到（preload 未更新）'
     admin.value = await svc.isAdmin()
-    settings.value = store.getSettings()
-    whitelist.value = store.getWhitelist()
-    storageDiag.value = storageSelfTest()
-    await refreshStatuses()
-    await refreshAuth()
+    settings.value = await store.getSettings()
+    whitelist.value = await store.getWhitelist()
+    // 进入只走 sc.exe 热路径立即上屏（几十 ms）；描述/账户/启动类型等完整信息
+    // 后台按需补全（sc qc + reg 单键，零 PowerShell/WMI —— v1.0.5 卡死整改的核心）
+    await pollTick()
+    statusLoaded.value = true
+    whitelist.value.forEach(w => { if (!fullDone[w.name]) loadFull(w.name) })
+    refreshAuth()
   } catch (e) {
     toast('初始化失败：' + (e && e.message), 'error')
-  }
-}
-/* 全量刷新（PowerShell 冷路径）：仅进入插件时调用，取启动类型/显示名等完整信息 */
-async function refreshStatuses () {
-  const names = whitelist.value.map(w => w.name)
-  if (!names.length) return
-  let rows = []
-  try {
-    rows = await svc.getStatuses(names)
-    statusLoaded.value = true
-  } catch (e) { return }
-  for (const r of rows) {
-    const old = live[r.name]
-    if (old && old.state && r.state && old.state !== r.state && !busy[r.name]) {
-      changed[r.name] = true
-      setTimeout(() => { delete changed[r.name] }, 900)
-    }
-    live[r.name] = r
   }
 }
 /* 轻量刷新（sc.exe 热路径）：只刷新状态/可暂停位，与已缓存的完整信息合并。
@@ -97,6 +82,16 @@ async function pollTick () {
     }
     live[r.name] = Object.assign({}, live[r.name], r)
   }
+}
+/* 完整信息懒加载：sc query + sc qc + reg 单键三命令并行（各几十 ms，零 WMI）。
+   首次进入后台补全 + 展开卡片时兜底，失败清标记让下次展开可重试。 */
+const fullDone = reactive({})
+async function loadFull (name) {
+  fullDone[name] = true
+  try {
+    const rows = await svc.getStatuses([name])
+    if (rows[0]) live[rows[0].name] = Object.assign({}, live[rows[0].name], rows[0])
+  } catch (e) { delete fullDone[name] }
 }
 
 onMounted(() => {
@@ -161,8 +156,12 @@ async function doSetType (name, t) {
   busy[name] = true
   try {
     const r = await svc.setStartType(name, t)
-    if (r.ok) toast(`${name} 启动类型已修改`, 'ok')
-    else toast(`${name} 修改失败：${r.message}`, 'error')
+    if (r.ok) {
+      live[name] = Object.assign({}, live[name], { startType: t }) // 热路径轮询不带回启动类型，直接回写避免界面停留旧值
+      toast(`${name} 启动类型已修改`, 'ok')
+    } else {
+      toast(`${name} 修改失败：${r.message}`, 'error')
+    }
     if (!r.ok && r.errorCode === 5) authMap[name] = false
   } catch (e) {
     toast(`${name} 修改失败：${(e && e.message) || e}`, 'error')
@@ -172,26 +171,18 @@ async function doSetType (name, t) {
 async function addSvc (row) {
   if (addedSet.value.has(row.name)) return
   whitelist.value = [...whitelist.value, { name: row.name, displayName: row.displayName || row.name }]
-  const r = store.saveWhitelist(whitelist.value)
-  const env = {
-    rendererHasUtools: !!window.utools,
-    rendererHasDbStorage: !!(window.utools && window.utools.dbStorage),
-    rendererHasDb: !!(window.utools && window.utools.db)
-  }
-  if (svc.debugLog) svc.debugLog('addSvc ' + row.name + ' result=' + JSON.stringify(r) + ' env=' + JSON.stringify(env) + ' whitelist=' + JSON.stringify(whitelist.value))
+  const r = await store.saveWhitelist(whitelist.value)
+  if (svc.debugLog) svc.debugLog('addSvc ' + row.name + ' result=' + JSON.stringify(r))
   if (r.ok) toast(`已添加 ${row.name}`, 'ok')
   else toast(`保存失败：${r.errors.join('；')}`, 'error')
-  // 添加页快路径（sc+reg）已带回状态/启动类型，先上屏；下面的 PS 冷查询只补描述/账户等扩展信息
+  // 添加页快路径（sc+reg）已带回状态/启动类型，先上屏；描述/账户等扩展信息由 loadFull 后台补全
   live[row.name] = Object.assign({}, row, live[row.name])
-  svc.getStatuses([row.name]).then(rows => {
-    if (rows[0]) live[rows[0].name] = Object.assign({}, live[rows[0].name], rows[0])
-  }).catch(() => {})
   refreshAuth([row.name])
   refreshBurst(row.name)
 }
-function removeSvc (name) {
+async function removeSvc (name) {
   whitelist.value = whitelist.value.filter(w => w.name !== name)
-  const r = store.saveWhitelist(whitelist.value)
+  const r = await store.saveWhitelist(whitelist.value)
   if (!r.ok) toast(`保存失败：${r.errors.join('；')}`, 'error')
   delete live[name]
   if (expanded.value === name) expanded.value = null
@@ -199,14 +190,26 @@ function removeSvc (name) {
 }
 
 /* ---------- 设置 ---------- */
-function openSettings () {
+async function openSettings () {
   settingsOpen.value = true
-  audit.value = store.getAudit()
+  audit.value = await store.getAudit()
   refreshAuthNames()
 }
-function saveSettings (patch) {
-  settings.value = store.saveSettings(patch)
+async function saveSettings (patch) {
+  settings.value = await store.saveSettings(patch)
   toast('设置已保存', 'ok')
+}
+async function clearAuditLog () {
+  audit.value = []
+  await store.clearAudit()
+}
+async function runStorageSelfTest () {
+  storageDiag.value = null
+  try {
+    storageDiag.value = await store.storageSelfTest()
+  } catch (e) {
+    storageDiag.value = { ok: false, error: (e && e.message) || String(e), via: '-', backends: {} }
+  }
 }
 
 /* ---------- 计算属性 ---------- */
@@ -225,11 +228,16 @@ const visibleList = computed(() => {
   }
   return whitelist.value
 })
-function toggleExpand (name) { expanded.value = expanded.value === name ? null : name }
+function toggleExpand (name) {
+  expanded.value = expanded.value === name ? null : name
+  if (expanded.value === name && !fullDone[name]) loadFull(name) // 详情兜底懒加载（进入时的后台补全失败时在此重试）
+}
 const unauthNames = computed(() => whitelist.value
   .filter(w => !admin.value && authMap[w.name] === false)
   .map(w => w.name))
 /* ---------- 授权（按服务一次性 SDDL 授权，UAC 确认） ---------- */
+// granting 同时覆盖授权与撤销：两者共用一条 UAC 提权通道，等待期间顶部悬浮横幅可见、可取消
+function cancelElevation () { if (svc.cancelElevated) svc.cancelElevated() }
 async function refreshAuth (names) {
   const list = names || whitelist.value.map(w => w.name)
   if (!list.length) return
@@ -244,9 +252,6 @@ async function refreshAuth (names) {
 async function grantAuth (names) {
   if (granting.value || !names.length) return
   granting.value = true
-  toast(names.length > 1
-    ? `正在为 ${names.length} 个服务授权，请在弹出的 UAC 窗口点「是」…`
-    : `正在为 ${names[0]} 授权，请在弹出的 UAC 窗口点「是」…`)
   try {
     const r = await svc.grantAuth(names)
     for (const x of ((r && r.results) || [])) if (x.ok) authMap[x.name] = true
@@ -269,20 +274,23 @@ async function revokeOne (name) { doRevoke([name]) }
 function revokeAll () { doRevoke(authNames.value.slice()) }
 /* 批量撤销：一次 UAC 完成全部，逐个 ok 的才更新 authMap；结束后重读备份库刷新列表 */
 async function doRevoke (list) {
-  if (!list.length) return
+  if (!list.length || granting.value) return
+  granting.value = true
   try {
     const r = await svc.revokeAuth(list)
     const okNames = ((r && r.results) || []).filter(x => x.ok).map(x => x.name)
     okNames.forEach(n => { authMap[n] = false })
     if (r && r.ok) {
       toast(list.length === 1 ? `已撤销 ${list[0]} 的授权` : `已撤销 ${okNames.length} 个服务的授权`, 'ok')
+    } else if (r && r.cancelled) {
+      toast('撤销已取消，授权保持不变', 'error')
     } else {
       const fail = ((r && r.results) || []).find(x => !x.ok)
       toast(`撤销失败：${(fail && fail.error) || (r && r.message) || '未知错误'}`, 'error')
     }
   } catch (e) {
     toast('撤销失败：' + ((e && e.message) || e), 'error')
-  }
+  } finally { granting.value = false }
   refreshAuthNames()
 }
 async function refreshAuthNames () {
@@ -310,6 +318,11 @@ async function refreshAuthNames () {
     </div>
     <div class="banner" v-if="storageDiag && !storageDiag.ok" style="color:var(--red);background:var(--red-bg)">
       <span>⚠ 本地存储不可用（{{ storageDiag.error }} · {{ storageDiag.via }}），重开后数据不会保存</span>
+    </div>
+    <!-- UAC 等待横幅：悬浮显示（撤销授权在设置弹层内发起，需盖过弹层），最长 60 秒，可取消 -->
+    <div class="banner elevating" v-if="granting">
+      <span>⏳ 等待 UAC 确认（最长 60 秒）… uTools 窗口可能因 UAC 抢焦点被隐藏，确认后请重新呼出 uTools</span>
+      <a @click="cancelElevation">取消</a>
     </div>
 
     <template v-if="view === 'add'">
@@ -347,9 +360,9 @@ async function refreshAuthNames () {
 
     <SettingsModal v-if="settingsOpen" :settings="settings" :audit="audit" :demo="isDemo"
                    :preload-build="preloadBuild" :storage-diag="storageDiag" :ui-build="UI_BUILD"
-                   :auth-names="authNames" :granting="granting"
-                   @close="settingsOpen = false" @save="saveSettings" @clear-audit="audit = []; store.clearAudit()"
-                   @revoke="revokeOne" @revoke-all="revokeAll" />
+                   :auth-names="authNames"
+                   @close="settingsOpen = false" @save="saveSettings" @clear-audit="clearAuditLog"
+                   @selftest="runStorageSelfTest" @revoke="revokeOne" @revoke-all="revokeAll" />
 
     <div class="toasts">
       <div v-for="t in toasts" :key="t.id" class="toast" :class="t.type">{{ t.msg }}</div>

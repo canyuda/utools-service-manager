@@ -66,6 +66,45 @@ function parseRegDwordByName (stdout, valName) {
 function parseScQueryAll (stdout) { return parseScQueryBlocks(stdout) }
 function parseScQueryOne (stdout) { return parseScQueryBlocks(stdout)[0] || null }
 
+/* ---------------- sc qc 输出解析 ---------------- */
+// 解析 `sc qc <name>` 输出 → { startTypeNum, binPath, account, displayName }
+// START_TYPE 行形如 "START_TYPE         : 2   AUTO_START"，数字部分非本地化；字段名恒为英文。
+function parseScQc (stdout) {
+  const out = { startTypeNum: 0, binPath: '', account: '', displayName: '' }
+  if (!stdout) return out
+  for (const line of String(stdout).split(/\r?\n/)) {
+    const m = /^\s*([A-Z_]+)[ \t]*:[ \t]*(.*)$/.exec(line)
+    if (!m) continue
+    const v = m[2].trim()
+    if (m[1] === 'START_TYPE') {
+      const n = /^(\d+)/.exec(v)
+      if (n) out.startTypeNum = Number(n[1])
+    } else if (m[1] === 'BINARY_PATH_NAME') {
+      // 引号只包路径部分（"C:\path\to\exe" args），剥掉包裹引号保留参数
+      const q = /^"([^"]*)"\s+(.*)$/.exec(v)
+      out.binPath = q ? (q[1] + ' ' + q[2]) : v.replace(/^"(.*)"$/, '$1')
+    } else if (m[1] === 'SERVICE_START_NAME') {
+      out.account = v
+    } else if (m[1] === 'DISPLAY_NAME') {
+      out.displayName = v
+    }
+  }
+  return out
+}
+
+/* ---------------- reg.exe 单键全值输出解析 ---------------- */
+// 解析 `reg query HKLM\...\Services\<name>`（不带 /v，单键全值）→ { 值名: 原始值串 }
+// 值行形如 "    DelayedAutostart    REG_DWORD    0x1"；键头/子键头/本地化行无 REG_ 类型词，天然跳过。
+function parseRegValuesByName (stdout) {
+  const out = {}
+  if (!stdout) return out
+  for (const line of String(stdout).split(/\r?\n/)) {
+    const m = /^\s*(\S+)[ \t]+(REG_SZ|REG_DWORD|REG_EXPAND_SZ|REG_BINARY|REG_MULTI_SZ|REG_QWORD)[ \t]+(.*)$/.exec(line)
+    if (m) out[m[1]] = m[3].trim()
+  }
+  return out
+}
+
 /* ---------------- SDDL 安全描述符 ---------------- */
 // 从 `sc sdshow` 输出提取 SDDL（D: 开头那一行）
 function extractSddl (stdout) {
@@ -159,6 +198,8 @@ module.exports = {
   SC_STATE_WORD,
   parseScQueryAll,
   parseScQueryOne,
+  parseScQc,
+  parseRegValuesByName,
   parseRegDwordByName,
   extractSddl,
   sddlHasRights,

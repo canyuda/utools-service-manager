@@ -10,7 +10,7 @@ const props = defineProps({
   uiBuild: { type: String, default: '' },
   authNames: { type: Array, default: () => [] }   // 已授权（有备份）的服务名
 })
-const emit = defineEmits(['close', 'save', 'clear-audit', 'revoke', 'revoke-all'])
+const emit = defineEmits(['close', 'save', 'clear-audit', 'selftest', 'revoke', 'revoke-all'])
 
 const fmtTime = (ts) => new Date(ts).toLocaleString('zh-CN', { hour12: false })
 const shortInput = (input) => {
@@ -33,6 +33,7 @@ const auditRows = computed(() => props.audit || [])
             · 存储自检：{{ storageDiag.ok ? '通过' : '失败' }}
             <span v-if="storageDiag.backends">（{{ Object.entries(storageDiag.backends).map(([k, v]) => k + '=' + v).join('，') }}）</span>
           </template>
+          <a class="auth-link" style="margin-left:6px" @click="emit('selftest')">{{ storageDiag ? '重新自检' : '存储自检' }}</a>
         </div>
         <div class="switch-row">
           <div class="switch" :class="{ on: settings.mcpEnabled }" @click="emit('save', { mcpEnabled: !settings.mcpEnabled })">

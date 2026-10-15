@@ -121,7 +121,7 @@
       }
     },
     "storage_debug": {
-      "description": "诊断工具：返回插件本地存储在两个后端（dbStorage 键值库 / db 文档库）中白名单、设置、审计键的原始内容，仅用于排查数据持久化问题，不修改任何数据。",
+      "description": "诊断工具：返回插件在 uTools 数据库中白名单、设置、授权备份键的原始内容，以及本地审计文件（插件本地数据目录 audit.json）内容，仅用于排查数据持久化问题，不修改任何数据。",
       "inputSchema": { "type": "object", "additionalProperties": false }
     }
   }
